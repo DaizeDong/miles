@@ -75,6 +75,46 @@ def _install_argument_test_stubs():
         sglang_args_module.validate_args = lambda args: None
         sys.modules["miles.backends.sglang_utils.arguments"] = sglang_args_module
 
+    if "httpx" not in sys.modules:
+        httpx_module = types.ModuleType("httpx")
+
+        class Limits:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+        class Timeout:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+        class Client:
+            def __init__(self, *args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+
+        class AsyncClient(Client):
+            async def get(self, *args, **kwargs):
+                raise RuntimeError("httpx.AsyncClient.get should not be called in predictive argument tests.")
+
+            async def post(self, *args, **kwargs):
+                raise RuntimeError("httpx.AsyncClient.post should not be called in predictive argument tests.")
+
+            async def delete(self, *args, **kwargs):
+                raise RuntimeError("httpx.AsyncClient.delete should not be called in predictive argument tests.")
+
+        class HTTPStatusError(Exception):
+            def __init__(self, *args, response=None, **kwargs):
+                super().__init__(*args)
+                self.response = response
+
+        httpx_module.Limits = Limits
+        httpx_module.Timeout = Timeout
+        httpx_module.Client = Client
+        httpx_module.AsyncClient = AsyncClient
+        httpx_module.HTTPStatusError = HTTPStatusError
+        sys.modules["httpx"] = httpx_module
+
 
 _install_argument_test_stubs()
 
@@ -94,7 +134,7 @@ def _make_parser():
 def _make_validation_args(**overrides):
     values = {
         "enable_predictive_routing_replay": False,
-        "bias_predictor_loss_type": "kl",
+        "bias_predictor_loss_type": "kl-post",
         "bias_predictor_lr_mult": 1000.0,
         "predictive_downsample_batch_size": None,
         "predictive_downsample_max_len_limit": None,
@@ -134,6 +174,18 @@ def test_predictive_flags_parse():
     assert args.predictive_downsample_batch_size == 4
     assert args.predictive_downsample_max_len_limit == 1024
     assert args.predictive_storage_dtype == "fp16"
+
+
+def test_predictive_loss_type_defaults_to_kl_post():
+    parser = _make_parser()
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "64",
+        ]
+    )
+
+    assert args.bias_predictor_loss_type == "kl-post"
 
 
 def test_predictive_validation_sets_aliases():

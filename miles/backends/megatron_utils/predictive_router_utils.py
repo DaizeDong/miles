@@ -6,8 +6,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from ..training_utils.cp_utils import slice_with_cp
-
 logger = logging.getLogger(__name__)
 
 PREDICTIVE_STORAGE_DTYPE_MAP = {
@@ -84,6 +82,55 @@ def _to_cpu_storage_tensor(value: torch.Tensor) -> torch.Tensor:
     return cpu_value
 
 
+def _get_local_packed_token_count(
+    *,
+    total_length: int,
+    parallel_state,
+    qkv_format: str,
+    max_seq_len: int | None = None,
+) -> int:
+    cp_size = int(getattr(parallel_state, "cp_size", 1))
+    if qkv_format == "bshd":
+        if max_seq_len is None:
+            raise ValueError("max_seq_len must be provided when qkv_format='bshd'.")
+        base_length = int(max_seq_len)
+    elif qkv_format == "thd":
+        base_length = int(total_length)
+    else:
+        raise ValueError(f"Unsupported qkv_format: {qkv_format}")
+
+    if cp_size <= 1:
+        return base_length
+
+    chunk_size = (base_length + 2 * cp_size - 1) // (2 * cp_size)
+    return 2 * chunk_size
+
+
+def _select_predictive_sample_indices(
+    *,
+    sample_lengths: Sequence[int],
+    downsample_batch_size: int | None = None,
+    max_len_limit: int | None = None,
+    generator: torch.Generator | None = None,
+) -> list[int]:
+    valid_indices = [index for index, sample_length in enumerate(sample_lengths) if int(sample_length) > 0]
+    if downsample_batch_size is None or downsample_batch_size >= len(valid_indices):
+        return list(valid_indices)
+
+    if max_len_limit is None:
+        filtered_indices = list(valid_indices)
+    else:
+        filtered_indices = [index for index in valid_indices if int(sample_lengths[index]) <= max_len_limit]
+
+    if len(filtered_indices) >= downsample_batch_size:
+        perm = torch.randperm(len(filtered_indices), generator=generator)[:downsample_batch_size].tolist()
+        return sorted(filtered_indices[idx] for idx in perm)
+
+    sampled_indices = sorted(valid_indices, key=lambda index: (int(sample_lengths[index]), index))[:downsample_batch_size]
+    sampled_indices.sort()
+    return sampled_indices
+
+
 def build_local_predictive_sample_lengths(
     *,
     total_lengths: Sequence[int],
@@ -106,14 +153,14 @@ def build_local_predictive_sample_lengths(
     sample_lengths = []
     for sample_idx, total_length in enumerate(total_lengths):
         max_seq_len = None if max_seq_lens is None else max_seq_lens[sample_idx]
-        local_tokens = slice_with_cp(
-            torch.empty(total_length, dtype=torch.int8),
-            0,
-            parallel_state,
-            qkv_format,
-            max_seq_len,
+        sample_lengths.append(
+            _get_local_packed_token_count(
+                total_length=total_length,
+                parallel_state=parallel_state,
+                qkv_format=qkv_format,
+                max_seq_len=max_seq_len,
+            )
         )
-        sample_lengths.append(int(local_tokens.shape[0]))
     return sample_lengths
 
 
@@ -192,43 +239,62 @@ def pack_recorded_predictive_microbatch(
             f"Local sample lengths sum {consumed_token_count} exceeds recorded token count {token_count}."
         )
 
-    stacked_inputs = torch.stack([old_input.detach() for old_input in recorded_old_inputs], dim=1)
-    stacked_logits = torch.stack([old_logit.detach() for old_logit in recorded_old_logits], dim=1)
-
-    old_inputs_list = []
-    old_logits_list = []
-    offset = 0
-    for sample_length in sample_lengths:
-        next_offset = offset + sample_length
-        old_inputs_list.append(stacked_inputs[offset:next_offset])
-        old_logits_list.append(stacked_logits[offset:next_offset])
-        offset = next_offset
-
-    selection = select_predictive_samples(
-        old_inputs_list=old_inputs_list,
-        old_logits_list=old_logits_list,
+    sampled_indices = _select_predictive_sample_indices(
+        sample_lengths=sample_lengths,
         downsample_batch_size=downsample_batch_size,
         max_len_limit=max_len_limit,
-        storage_dtype=storage_dtype,
         generator=generator,
     )
+    offset = 0
+    sample_ranges = []
+    for sample_length in sample_lengths:
+        next_offset = offset + sample_length
+        sample_ranges.append((offset, next_offset))
+        offset = next_offset
+
     valid_mask = build_sampled_token_mask(
         sample_lengths=sample_lengths,
-        sampled_indices=selection.sampled_indices,
+        sampled_indices=sampled_indices,
         total_token_count=token_count,
     )
+    if not sampled_indices:
+        return RecordedPredictiveMicrobatch(
+            old_inputs_concat=None,
+            old_logits_concat=None,
+            valid_mask=_to_cpu_storage_tensor(valid_mask),
+            sampled_indices=[],
+            sample_lengths=sample_lengths,
+            total_token_count=token_count,
+        )
 
-    old_inputs_concat = None
-    old_logits_concat = None
-    if selection.sampled_indices:
-        old_inputs_concat = _to_cpu_storage_tensor(torch.cat(selection.old_inputs, dim=0))
-        old_logits_concat = _to_cpu_storage_tensor(torch.cat(selection.old_logits, dim=0))
+    target_dtype = predictive_storage_dtype_to_torch_dtype(storage_dtype)
+    sampled_inputs_cpu = []
+    sampled_logits_cpu = []
+    for sample_idx in sampled_indices:
+        start_idx, end_idx = sample_ranges[sample_idx]
+        sample_input = torch.stack(
+            [old_input[start_idx:end_idx].detach() for old_input in recorded_old_inputs],
+            dim=1,
+        )
+        sample_logit = torch.stack(
+            [old_logit[start_idx:end_idx].detach() for old_logit in recorded_old_logits],
+            dim=1,
+        )
+        if sample_input.dtype != target_dtype:
+            sample_input = sample_input.to(target_dtype)
+        if sample_logit.dtype != target_dtype:
+            sample_logit = sample_logit.to(target_dtype)
+        sampled_inputs_cpu.append(_to_cpu_storage_tensor(sample_input))
+        sampled_logits_cpu.append(_to_cpu_storage_tensor(sample_logit))
+
+    old_inputs_concat = torch.cat(sampled_inputs_cpu, dim=0)
+    old_logits_concat = torch.cat(sampled_logits_cpu, dim=0)
 
     return RecordedPredictiveMicrobatch(
         old_inputs_concat=old_inputs_concat,
         old_logits_concat=old_logits_concat,
         valid_mask=_to_cpu_storage_tensor(valid_mask),
-        sampled_indices=selection.sampled_indices,
+        sampled_indices=sampled_indices,
         sample_lengths=sample_lengths,
         total_token_count=token_count,
     )

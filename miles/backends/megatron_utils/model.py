@@ -166,7 +166,7 @@ def setup_model_and_optimizer(
     initialize_predictive_router_modules(
         model_chunks=model,
         enabled=role == "actor" and getattr(args, "enable_predictive_routing_replay", False),
-        loss_type=getattr(args, "bias_predictor_loss_type", "kl"),
+        loss_type=getattr(args, "bias_predictor_loss_type", "kl-post"),
         lr_mult=getattr(args, "bias_predictor_lr_mult", 1.0),
     )
 

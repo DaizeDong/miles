@@ -14,6 +14,7 @@ from miles.backends.megatron_utils.predictive_router_replay import (
     restore_predictive_param_groups,
 )
 from miles.backends.megatron_utils.predictive_router_utils import (
+    build_local_predictive_sample_lengths,
     build_predictive_valid_mask,
     pack_recorded_predictive_microbatch,
     prepare_predictive_router_data,
@@ -175,6 +176,23 @@ def test_pack_recorded_predictive_microbatch_builds_mask_and_storage():
     assert packed.old_logits_concat.shape == torch.Size([2, 2, 4])
 
 
+def test_build_local_predictive_sample_lengths_uses_arithmetic_layout():
+    parallel_state = SimpleNamespace(cp_rank=0, cp_size=2)
+
+    assert build_local_predictive_sample_lengths(
+        total_lengths=[5, 8],
+        parallel_state=parallel_state,
+        qkv_format="thd",
+    ) == [4, 4]
+
+    assert build_local_predictive_sample_lengths(
+        total_lengths=[3, 7],
+        parallel_state=parallel_state,
+        qkv_format="bshd",
+        max_seq_lens=[8, 8],
+    ) == [4, 4]
+
+
 def test_prepare_predictive_router_data_trims_to_current_lengths():
     attention_mask = torch.tensor(
         [
@@ -238,7 +256,7 @@ def test_prepare_predictive_router_data_uses_explicit_positions():
 
     assert prepared.valid_indices == [0, 1]
     assert prepared.selected_current_lens == [2, 2]
-    assert prepared.valid_mask.tolist() == [True, False, True, True, True, False]
+    assert prepared.valid_mask.tolist() == [True, False, True, False, True, True]
 
 
 def test_predictive_router_replay_registry_and_metrics():

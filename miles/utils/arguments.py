@@ -1016,9 +1016,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--bias-predictor-loss-type",
                 type=str,
-                default="kl",
+                default="kl-post",
                 choices=PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES,
-                help="Loss used to train the predictive router bias predictor.",
+                help="Loss used to train the predictive router bias predictor. Defaults to the paper's main PR2 objective.",
             )
             parser.add_argument(
                 "--bias-predictor-lr-mult",
