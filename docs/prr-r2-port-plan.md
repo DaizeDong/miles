@@ -1,6 +1,6 @@
 # Predictive Routing Replay R2 Port Plan
 
-Status: in progress
+Status: complete
 Branch: `prr-r2-port`
 Baseline commit: `d0f6d88` (`chore: start PRR R2 port plan`)
 Date: 2026-03-23
