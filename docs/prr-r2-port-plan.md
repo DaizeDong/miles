@@ -67,6 +67,14 @@ Date: 2026-03-23
 - 2026-03-23: Completed Phase I. Rollout weight sync now filters
   `bias_predictor` weights on the rollout export path while preserving local
   actor backups and local old-actor / ref snapshots.
+- 2026-03-23: Post-port audit and optimization pass:
+  - changed the default predictive loss from `kl` to `kl-post` so the default
+    configuration now matches the paper's main PR2 objective
+  - optimized predictive microbatch packing to avoid stacking all router-layer
+    tensors for the full microbatch on GPU before downsampling
+  - replaced the old CP sample-length probe based on `slice_with_cp(torch.empty(...))`
+    with an arithmetic layout calculation to avoid throwaway tensor allocation
+  - extended fast tests and executed them in the `xllm` conda environment
 - 2026-03-23: Phase D-I verification status:
   - `python -m compileall miles/backends/megatron_utils/predictive_router_utils.py miles/backends/megatron_utils/predictive_router_replay.py miles/backends/megatron_utils/model.py miles/backends/megatron_utils/actor.py miles/backends/megatron_utils/update_weight/common.py miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py`
   - `python -m compileall tests/fast/backends/megatron_utils/test_predictive_router_utils.py tests/fast/utils/test_predictive_arguments.py`
@@ -75,6 +83,56 @@ Date: 2026-03-23
   - local shell still lacks `pytest`, `torch`, and Megatron runtime packages,
     so the new runtime / tensor tests were syntax-checked but not executed end
     to end here
+- 2026-03-23: Post-port audit verification status:
+  - `conda run -n xllm python -m pytest --noconftest tests/fast/backends/megatron_utils/test_predictive_router_utils.py -q`
+  - `conda run -n xllm python -m pytest --noconftest tests/fast/utils/test_predictive_arguments.py -q`
+  - both test modules passed locally in `xllm`
+
+## 0. Post-Port Audit
+
+### Performance findings
+
+- fixed: predictive packing used to stack `[all_tokens, all_layers, ...]`
+  tensors on GPU before any downsampling decision was applied
+- impact:
+  - unnecessary peak GPU memory proportional to the full local packed token
+    count times the number of MoE layers
+  - extra device work even when only a small downsampled subset was retained
+- current behavior:
+  - sample lengths are computed first
+  - sampled sequence indices are chosen first
+  - only selected sequences are stacked and copied to CPU storage
+
+### Paper-alignment audit
+
+Aligned with the paper:
+
+- rollout / old-logprob phase uses predicted routing paths `R_hat_old`
+- actor training still replays deterministic routing paths for stability
+- predictor parameters use a dedicated LR multiplier
+- default predictor loss is now `kl-post`, matching the paper's main PR2
+  objective `L_post`
+
+Remaining structural differences versus the paper:
+
+- Miles still performs a single actor train pass over each rollout batch
+  instead of the paper's two-phase multi-mini-step schedule where predictor
+  updates are skipped on mini-step 1 and enabled from mini-step 2 onward
+- phase-1 Miles PRR remains actor-side only:
+  - no predictive R3
+  - no union mode
+  - no rollout-side predictive state transport
+- `allgather_cp` remains unsupported because predictive states are stored in
+  local packed-token order and Miles does not yet carry token-position metadata
+  for that layout
+
+Interpretation:
+
+- the current Miles port is semantically aligned with the minimal PR2 R2
+  pipeline and with the existing `verl` implementation that served as source
+  code for the port
+- the main residual gap to the paper is the optimization schedule, not the
+  router-loss formula
 
 ## 1. Goal
 
