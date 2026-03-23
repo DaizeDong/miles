@@ -10,8 +10,12 @@ Date: 2026-03-23
 - Phase A: completed
 - Phase B: completed
 - Phase C: completed
-- Phase D: pending
-- Phase E: pending
+- Phase D: completed
+- Phase E: completed
+- Phase F: completed
+- Phase G: completed
+- Phase H: completed
+- Phase I: completed
 
 ## Progress Log
 
@@ -49,6 +53,28 @@ Date: 2026-03-23
   - `python -m compileall miles/backends/megatron_utils/model.py miles/backends/megatron_utils/predictive_router_replay.py`
   - no Megatron runtime or `torch` package is available in the current shell,
     so integration could only be syntax-checked locally
+- 2026-03-23: Completed Phases D-H as one integrated actor-side predictive
+  pipeline pass. The final Miles port records local router states immediately
+  after each old-logprob microbatch and replays them from a local in-memory
+  predictive buffer during the matching actor train microbatch.
+- 2026-03-23: Phase D-H design update:
+  - predictive router tensors are not returned through
+    `aggregate_forward_results(...)`
+  - each actor rank keeps its own local predictive replay queue, which keeps
+    PP / TP / CP-local router state aligned without adding new rollout payloads
+  - phase-1 predictive replay now explicitly rejects `--allgather-cp`; that
+    layout needs a separate token-position transport design
+- 2026-03-23: Completed Phase I. Rollout weight sync now filters
+  `bias_predictor` weights on the rollout export path while preserving local
+  actor backups and local old-actor / ref snapshots.
+- 2026-03-23: Phase D-I verification status:
+  - `python -m compileall miles/backends/megatron_utils/predictive_router_utils.py miles/backends/megatron_utils/predictive_router_replay.py miles/backends/megatron_utils/model.py miles/backends/megatron_utils/actor.py miles/backends/megatron_utils/update_weight/common.py miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py`
+  - `python -m compileall tests/fast/backends/megatron_utils/test_predictive_router_utils.py tests/fast/utils/test_predictive_arguments.py`
+  - direct stubbed smoke for `_validate_predictive_routing_replay_args(...)`
+    passed, including the new `allgather_cp` rejection path
+  - local shell still lacks `pytest`, `torch`, and Megatron runtime packages,
+    so the new runtime / tensor tests were syntax-checked but not executed end
+    to end here
 
 ## 1. Goal
 
@@ -158,8 +184,8 @@ The final phase-1 behavior should be:
 1. Enable standard `R2` replay in `miles`.
 2. When predictive mode is enabled, each router also owns a bias predictor.
 3. During old-logprob computation, router inputs and router logits are recorded.
-4. The recorded predictive tensors are downsampled and attached to the local
-   rollout/training data path.
+4. The recorded predictive tensors are downsampled and attached to a local
+   actor-side predictive replay buffer.
 5. During actor training, the predictor computes a loss against the delta
    between old logits and current logits.
 6. Predictor gradients are applied only on predictive-enabled train passes.
@@ -295,6 +321,10 @@ Acceptance criteria:
 
 Predictor parameters need a different learning rate regime.
 
+Status:
+
+- completed on 2026-03-23
+
 Target files:
 
 - `miles/backends/megatron_utils/model.py`
@@ -316,6 +346,10 @@ Acceptance criteria:
 
 Add predictive recording during old-logprob computation.
 
+Status:
+
+- completed on 2026-03-23
+
 Target files:
 
 - `miles/backends/megatron_utils/actor.py`
@@ -331,17 +365,14 @@ Required behavior:
   - standard replay data
   - predictive old inputs / old logits
 
-Needed support:
+Implemented adaptation:
 
-- a forward collection path analogous to `verl`'s `layers_predictive_states`
-- aggregation over micro-batches in the order expected by `miles`
-
-Important adaptation:
-
-- this data path must fit `miles`'s `forward_only(...)` and
-  `aggregate_forward_results(...)` structure
-- values are best carried as per-sample Python lists of variable-shape arrays,
-  not padded tensors
+- predictive states are collected immediately after each local microbatch
+  forward inside `forward_only(...)`
+- the collected tensors are packed into a local predictive replay buffer keyed
+  by microbatch order
+- no predictive tensors are routed through
+  `aggregate_forward_results(...)`
 
 Acceptance criteria:
 
@@ -351,6 +382,10 @@ Acceptance criteria:
 ### Phase F: Predictive Data Packing And Transport
 
 Adapt the `verl` predictive helpers into `miles`.
+
+Status:
+
+- completed on 2026-03-23
 
 Recommended new file:
 
@@ -378,10 +413,12 @@ Data model for phase 1:
 
 Transport path inside `miles`:
 
-1. attach to rollout/training dict after old-logprob
-2. preserve through `DataIterator`
-3. split into micro-batches aligned with training order
-4. load into local router instances before actor train forward
+1. collect local router tensors after each old-logprob microbatch
+2. split them by local packed-token sample boundaries
+3. apply sample-level downsampling and CPU storage conversion
+4. queue the packed tensors in a local predictive replay buffer
+5. load the queued tensors back into local router instances before actor train
+   forward
 
 Acceptance criteria:
 
@@ -391,6 +428,10 @@ Acceptance criteria:
 ### Phase G: Actor Train-Time Predictive Loss
 
 Integrate predictive loss into the actor train pipeline.
+
+Status:
+
+- completed on 2026-03-23
 
 Target files:
 
@@ -430,6 +471,10 @@ Acceptance criteria:
 
 Add predictor metrics to `miles` logging.
 
+Status:
+
+- completed on 2026-03-23
+
 Target files:
 
 - `miles/backends/training_utils/log_utils.py`
@@ -451,6 +496,10 @@ Acceptance criteria:
 Phase-1 recommended implementation:
 
 - filter predictor-only params out of rollout weight sync
+
+Status:
+
+- completed on 2026-03-23
 
 Target file:
 
@@ -480,6 +529,8 @@ Primary implementation files:
 - `miles/backends/training_utils/data.py`
 - `miles/backends/training_utils/log_utils.py`
 - `miles/backends/megatron_utils/update_weight/common.py`
+- `miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py`
+- `miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py`
 - `docker/patch/latest/megatron.patch`
 
 Recommended new files:

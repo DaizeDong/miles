@@ -58,6 +58,12 @@ def _validate_predictive_routing_replay_args(args):
     if not getattr(args, "use_routing_replay", False):
         raise AssertionError("--enable-predictive-routing-replay requires --use-routing-replay.")
 
+    if getattr(args, "allgather_cp", False):
+        raise AssertionError(
+            "predictive routing replay phase 1 does not support --allgather-cp because predictive states are "
+            "recorded and replayed in local packed-token order."
+        )
+
     if args.bias_predictor_loss_type not in PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES:
         raise AssertionError(
             f"Unsupported bias predictor loss type: {args.bias_predictor_loss_type}. "
