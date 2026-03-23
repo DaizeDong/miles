@@ -42,6 +42,7 @@ from .predictive_router_replay import (
     RouterPredictiveAction,
     predictive_action_scope,
 )
+from .predictive_train_schedule import get_predictive_actor_train_pass_count
 from .replay_utils import get_register_replay_list_func
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
@@ -391,6 +392,10 @@ class MegatronTrainRayActor(TrainRayActor):
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, self.parallel_state, rollout_data)
         predictive_enabled = getattr(self.args, "enable_predictive_routing_replay", False)
+        predictive_train_pass_count = get_predictive_actor_train_pass_count(
+            role="actor",
+            predictive_enabled=predictive_enabled,
+        )
         if predictive_enabled and not self.args.compute_advantages_and_returns:
             raise RuntimeError(
                 "Predictive routing replay requires compute_advantages_and_returns in Miles so old actor logprobs "
@@ -468,14 +473,47 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             self._set_replay_stage("replay_backward")
             with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                )
+                if predictive_enabled:
+                    logger.info(
+                        "[Predictive Routing Replay] Running two-phase actor training for rollout %s: "
+                        "pass 1 uses SKIP_PREDICTIVE, pass 2 reuses the rollout batch with COMPUTE_PREDICTIVE_LOSS.",
+                        rollout_id,
+                    )
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        self.parallel_state,
+                        predictive_train_mode="skip",
+                        train_pass_index=0,
+                        num_train_passes=predictive_train_pass_count,
+                    )
+                    PredictiveRouterReplayBuffer.reset_train_cursor()
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        self.parallel_state,
+                        predictive_train_mode="compute",
+                        train_pass_index=1,
+                        num_train_passes=predictive_train_pass_count,
+                    )
+                else:
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        self.parallel_state,
+                    )
                 if predictive_enabled and PredictiveRouterReplayBuffer.remaining_microbatch_count() != 0:
                     raise RuntimeError(
                         "Predictive routing replay buffer was not fully consumed during actor training: "

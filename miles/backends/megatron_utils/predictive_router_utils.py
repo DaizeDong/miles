@@ -76,6 +76,8 @@ def _as_tensor(value: Any) -> torch.Tensor | None:
 def _to_cpu_storage_tensor(value: torch.Tensor) -> torch.Tensor:
     value = value.detach().contiguous()
     if value.device.type == "cpu":
+        if torch.cuda.is_available() and not value.is_pinned():
+            return value.pin_memory()
         return value
     cpu_value = torch.empty_like(value, device="cpu", pin_memory=True)
     cpu_value.copy_(value, non_blocking=False)

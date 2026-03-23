@@ -200,11 +200,19 @@ def apply_predictive_router_replay_patch() -> None:
 
         old_inputs, old_logits, valid_mask = predictive_state.get_predictive_data()
         if predictive_state.has_valid_predictive_data():
-            old_inputs = old_inputs.to(device=input.device, dtype=input.dtype)
-            old_logits = old_logits.to(device=logits.device, dtype=logits.dtype)
+            old_inputs = old_inputs.to(
+                device=input.device,
+                dtype=input.dtype,
+                non_blocking=old_inputs.device.type == "cpu",
+            )
+            old_logits = old_logits.to(
+                device=logits.device,
+                dtype=logits.dtype,
+                non_blocking=old_logits.device.type == "cpu",
+            )
             current_logits = logits
             if valid_mask is not None:
-                valid_mask = valid_mask.to(device=input.device)
+                valid_mask = valid_mask.to(device=input.device, non_blocking=valid_mask.device.type == "cpu")
                 current_logits = logits[valid_mask]
             predicted_delta_logits = bias_predictor(old_inputs)
             predictive_loss = compute_predictive_loss(
