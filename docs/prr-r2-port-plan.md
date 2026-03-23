@@ -1,9 +1,33 @@
 # Predictive Routing Replay R2 Port Plan
 
-Status: planned
+Status: in progress
 Branch: `prr-r2-port`
 Baseline commit: `d0f6d88` (`chore: start PRR R2 port plan`)
 Date: 2026-03-23
+
+## Progress Tracker
+
+- Phase A: completed
+- Phase B: pending
+- Phase C: pending
+- Phase D: pending
+- Phase E: pending
+
+## Progress Log
+
+- 2026-03-23: Started full implementation pass. Re-validated `verl -> miles`
+  source mapping, confirmed current `miles` worktree is dirty, and locked the
+  phase order to avoid mixing predictive changes with unrelated local edits.
+- 2026-03-23: Completed Phase A. Added predictive routing replay CLI flags,
+  a dedicated argument validator, and a focused fast test module with local
+  dependency stubs so the argument layer can be exercised without full SGLang
+  or Ray runtime dependencies.
+- 2026-03-23: Phase A verification status:
+  - `python -m compileall miles/utils/arguments.py tests/fast/utils/test_predictive_arguments.py`
+  - local smoke import with stubbed `transformers` / `ray` / `sglang_router`
+    passed
+  - `pytest` is not installed in the current shell environment, so the new
+    pytest module was verified statically and with direct smoke execution only
 
 ## 1. Goal
 
@@ -125,6 +149,10 @@ The final phase-1 behavior should be:
 ### Phase A: Configuration Surface
 
 Add predictive-specific flags to `miles`.
+
+Status:
+
+- completed on 2026-03-23
 
 Target file:
 
