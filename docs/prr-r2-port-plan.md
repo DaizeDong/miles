@@ -84,6 +84,13 @@ Date: 2026-03-23
   - expanded actor scheduler train-iter accounting and train-step logging so
     LR scheduling and tracking reflect the extra predictive actor pass
   - added a pure fast-test module for predictive train-pass scheduling
+- 2026-03-23: Post-alignment review pass:
+  - fixed stale single-pass step-id math that still remained in Megatron train
+    logging and CI KL checks after the two-phase schedule landed
+  - fixed CI grad-norm save/load path formatting so train-pass-specific runs no
+    longer collide on the same filename
+  - added focused fast tests for pass-aware `check_kl(...)` and
+    `check_grad_norm(...)`
 - 2026-03-23: Phase D-I verification status:
   - `python -m compileall miles/backends/megatron_utils/predictive_router_utils.py miles/backends/megatron_utils/predictive_router_replay.py miles/backends/megatron_utils/model.py miles/backends/megatron_utils/actor.py miles/backends/megatron_utils/update_weight/common.py miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py`
   - `python -m compileall tests/fast/backends/megatron_utils/test_predictive_router_utils.py tests/fast/utils/test_predictive_arguments.py`
@@ -100,6 +107,10 @@ Date: 2026-03-23
   - `python -m compileall miles/backends/megatron_utils/predictive_train_schedule.py miles/backends/megatron_utils/model.py miles/backends/megatron_utils/actor.py miles/backends/megatron_utils/predictive_router_replay.py miles/backends/megatron_utils/predictive_router_utils.py miles/backends/training_utils/log_utils.py tests/fast/backends/megatron_utils/test_predictive_train_schedule.py`
   - `conda run -n xllm python -m pytest --noconftest tests/fast/backends/megatron_utils/test_predictive_train_schedule.py tests/fast/backends/megatron_utils/test_predictive_router_utils.py tests/fast/utils/test_predictive_arguments.py -q`
   - all 33 fast tests passed locally in `xllm`
+- 2026-03-23: Post-alignment review verification status:
+  - `python -m compileall miles/backends/training_utils/ci_utils.py miles/backends/megatron_utils/model.py tests/fast/backends/training_utils/test_ci_utils.py`
+  - `conda run -n xllm python -m pytest --noconftest tests/fast/backends/training_utils/test_ci_utils.py tests/fast/backends/megatron_utils/test_predictive_train_schedule.py tests/fast/backends/megatron_utils/test_predictive_router_utils.py tests/fast/utils/test_predictive_arguments.py -q`
+  - all 35 fast tests passed locally in `xllm`
 
 ## 0. Post-Port Audit
 

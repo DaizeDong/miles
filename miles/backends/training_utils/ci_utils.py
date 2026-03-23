@@ -6,11 +6,21 @@ from argparse import Namespace
 
 import torch
 
+from ..megatron_utils.predictive_train_schedule import get_rollout_train_step_id
+
 logger = logging.getLogger(__name__)
 
 
-def check_kl(args: Namespace, log_dict: dict[str, float], step_id: int, accumulated_step_id: int) -> None:
-    if step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
+def check_kl(
+    args: Namespace,
+    log_dict: dict[str, float],
+    step_id: int,
+    accumulated_step_id: int,
+    train_pass_index: int = 0,
+    num_steps_per_rollout: int = 1,
+) -> None:
+    effective_step_id = train_pass_index * num_steps_per_rollout + step_id
+    if effective_step_id == 0 and "train/ppo_kl" in log_dict and "train/pg_clipfrac" in log_dict:
         if args.multi_latent_attention:
             # TODO: mla currently have non-zero kl, need further investigation
             assert log_dict["train/ppo_kl"] < 1e-8, f"{log_dict=}"
@@ -29,6 +39,9 @@ def check_grad_norm(
     grad_norm: float,
     rollout_id: int,
     step_id: int,
+    train_pass_index: int = 0,
+    num_steps_per_rollout: int = 1,
+    num_train_passes: int = 1,
     role: str = "actor",
     rank: int = 0,
 ) -> None:
@@ -36,11 +49,23 @@ def check_grad_norm(
     if rank != 0:
         return
 
+    accumulated_step_id = get_rollout_train_step_id(
+        rollout_id=rollout_id,
+        step_id=step_id,
+        num_steps_per_rollout=num_steps_per_rollout,
+        train_pass_index=train_pass_index,
+        num_train_passes=num_train_passes,
+    )
+
     if args.ci_save_grad_norm is not None:
         ci_save_grad_norm_path = args.ci_save_grad_norm.format(
             role=role,
             rollout_id=rollout_id,
             step_id=step_id,
+            train_pass_index=train_pass_index,
+            num_steps_per_rollout=num_steps_per_rollout,
+            num_train_passes=num_train_passes,
+            accumulated_step_id=accumulated_step_id,
         )
         torch.save(grad_norm, ci_save_grad_norm_path)
 
@@ -49,6 +74,10 @@ def check_grad_norm(
             role=role,
             rollout_id=rollout_id,
             step_id=step_id,
+            train_pass_index=train_pass_index,
+            num_steps_per_rollout=num_steps_per_rollout,
+            num_train_passes=num_train_passes,
+            accumulated_step_id=accumulated_step_id,
         )
         expected_grad_norm = torch.load(ci_load_grad_norm_path, weights_only=False)
         assert math.isclose(

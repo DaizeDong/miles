@@ -57,7 +57,7 @@ from .predictive_router_replay import (
     initialize_predictive_router_modules,
     restore_predictive_param_groups,
 )
-from .predictive_train_schedule import get_effective_train_iters
+from .predictive_train_schedule import get_effective_train_iters, get_rollout_train_step_id
 from .predictive_router_utils import pack_recorded_predictive_microbatch
 
 logger = logging.getLogger(__name__)
@@ -801,7 +801,13 @@ def train(
 
         # per train step log.
         if is_megatron_main_rank():
-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
+            accumulated_step_id = get_rollout_train_step_id(
+                rollout_id=rollout_id,
+                step_id=step_id,
+                num_steps_per_rollout=num_steps_per_rollout,
+                train_pass_index=train_pass_index,
+                num_train_passes=num_train_passes,
+            )
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
 
@@ -830,7 +836,14 @@ def train(
             )
 
             if args.ci_test and not args.ci_disable_kl_checker:
-                check_kl(args, log_dict, step_id, accumulated_step_id)
+                check_kl(
+                    args,
+                    log_dict,
+                    step_id,
+                    accumulated_step_id,
+                    train_pass_index=train_pass_index,
+                    num_steps_per_rollout=num_steps_per_rollout,
+                )
 
             logger.info(f"{role_tag}step {accumulated_step_id}: {log_dict}")
 
@@ -840,6 +853,9 @@ def train(
                     grad_norm=grad_norm,
                     rollout_id=rollout_id,
                     step_id=step_id,
+                    train_pass_index=train_pass_index,
+                    num_steps_per_rollout=num_steps_per_rollout,
+                    num_train_passes=num_train_passes,
                     role=role,
                     rank=mpu.get_data_parallel_rank(),
                 )
