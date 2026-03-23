@@ -75,6 +75,15 @@ Date: 2026-03-23
   - replaced the old CP sample-length probe based on `slice_with_cp(torch.empty(...))`
     with an arithmetic layout calculation to avoid throwaway tensor allocation
   - extended fast tests and executed them in the `xllm` conda environment
+- 2026-03-23: Schedule-alignment pass:
+  - updated Miles actor training to reuse each rollout batch for two actor
+    passes when predictive replay is enabled
+  - phase 1 now matches the paper's two-phase PR2 schedule:
+    - pass 1 uses deterministic replay with `SKIP_PREDICTIVE`
+    - pass 2 reuses the same rollout batch with `COMPUTE_PREDICTIVE_LOSS`
+  - expanded actor scheduler train-iter accounting and train-step logging so
+    LR scheduling and tracking reflect the extra predictive actor pass
+  - added a pure fast-test module for predictive train-pass scheduling
 - 2026-03-23: Phase D-I verification status:
   - `python -m compileall miles/backends/megatron_utils/predictive_router_utils.py miles/backends/megatron_utils/predictive_router_replay.py miles/backends/megatron_utils/model.py miles/backends/megatron_utils/actor.py miles/backends/megatron_utils/update_weight/common.py miles/backends/megatron_utils/update_weight/update_weight_from_distributed.py miles/backends/megatron_utils/update_weight/hf_weight_iterator_direct.py`
   - `python -m compileall tests/fast/backends/megatron_utils/test_predictive_router_utils.py tests/fast/utils/test_predictive_arguments.py`
@@ -87,6 +96,10 @@ Date: 2026-03-23
   - `conda run -n xllm python -m pytest --noconftest tests/fast/backends/megatron_utils/test_predictive_router_utils.py -q`
   - `conda run -n xllm python -m pytest --noconftest tests/fast/utils/test_predictive_arguments.py -q`
   - both test modules passed locally in `xllm`
+- 2026-03-23: Schedule-alignment verification status:
+  - `python -m compileall miles/backends/megatron_utils/predictive_train_schedule.py miles/backends/megatron_utils/model.py miles/backends/megatron_utils/actor.py miles/backends/megatron_utils/predictive_router_replay.py miles/backends/megatron_utils/predictive_router_utils.py miles/backends/training_utils/log_utils.py tests/fast/backends/megatron_utils/test_predictive_train_schedule.py`
+  - `conda run -n xllm python -m pytest --noconftest tests/fast/backends/megatron_utils/test_predictive_train_schedule.py tests/fast/backends/megatron_utils/test_predictive_router_utils.py tests/fast/utils/test_predictive_arguments.py -q`
+  - all 33 fast tests passed locally in `xllm`
 
 ## 0. Post-Port Audit
 
@@ -112,12 +125,14 @@ Aligned with the paper:
 - predictor parameters use a dedicated LR multiplier
 - default predictor loss is now `kl-post`, matching the paper's main PR2
   objective `L_post`
+- Miles now reuses each rollout batch for the paper's two-phase predictive
+  schedule:
+  - train pass 1 skips predictor updates
+  - train pass 2 reuses the same batch and updates the predictor with
+    post-routing matching
 
-Remaining structural differences versus the paper:
+Remaining non-goals for this port:
 
-- Miles still performs a single actor train pass over each rollout batch
-  instead of the paper's two-phase multi-mini-step schedule where predictor
-  updates are skipped on mini-step 1 and enabled from mini-step 2 onward
 - phase-1 Miles PRR remains actor-side only:
   - no predictive R3
   - no union mode
@@ -129,10 +144,10 @@ Remaining structural differences versus the paper:
 Interpretation:
 
 - the current Miles port is semantically aligned with the minimal PR2 R2
-  pipeline and with the existing `verl` implementation that served as source
-  code for the port
-- the main residual gap to the paper is the optimization schedule, not the
-  router-loss formula
+  pipeline described in the paper and with the existing `verl`
+  implementation that served as source code for the port
+- within the scoped R2 actor-side port, there is no known remaining mismatch
+  in routing-path semantics, predictor objective, or two-phase update schedule
 
 ## 1. Goal
 

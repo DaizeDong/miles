@@ -57,6 +57,7 @@ from .predictive_router_replay import (
     initialize_predictive_router_modules,
     restore_predictive_param_groups,
 )
+from .predictive_train_schedule import get_effective_train_iters
 from .predictive_router_utils import pack_recorded_predictive_microbatch
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,11 @@ def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig, 
     return {ParamKey(attr="is_bias_predictor"): bias_predictor_optim_config}
 
 
-def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
+def get_optimizer_param_scheduler(
+    args: Namespace,
+    optimizer: MegatronOptimizer,
+    role: str = "actor",
+) -> OptimizerParamScheduler:
     """Create and configure the optimizer learning-rate/weight-decay scheduler.
 
     This configures iteration-based schedules derived from the global batch size
@@ -97,7 +102,18 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
         OptimizerParamScheduler: Initialized scheduler bound to ``optimizer``.
     """
     # Iteration-based training.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    base_train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    args.train_iters = get_effective_train_iters(
+        base_train_iters=base_train_iters,
+        role=role,
+        predictive_enabled=getattr(args, "enable_predictive_routing_replay", False),
+    )
+    if args.train_iters != base_train_iters:
+        logger.info(
+            "[Predictive Routing Replay] Expanded actor train iters from %s to %s to match the two-phase PR2 schedule.",
+            base_train_iters,
+            args.train_iters,
+        )
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -191,7 +207,7 @@ def setup_model_and_optimizer(
             )
         optimizer_kwargs["config_overrides"] = config_overrides
     optimizer = get_megatron_optimizer(**optimizer_kwargs)
-    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer, role=role)
     return model, optimizer, opt_param_scheduler
 
 
@@ -441,6 +457,7 @@ def train_one_step(
     opt_param_scheduler: OptimizerParamScheduler,
     num_microbatches: int,
     parallel_state: ParallelState,
+    predictive_train_mode: str = "compute",
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -523,7 +540,13 @@ def train_one_step(
             m.stage = "replay_forward"
 
         if predictive_router_enabled and not return_schedule_plan:
-            _prepare_predictive_train_microbatch(args)
+            if predictive_train_mode == "compute":
+                _prepare_predictive_train_microbatch(args)
+            elif predictive_train_mode == "skip":
+                PredictiveRouterReplayState.clear_global_predictive_data()
+                PredictiveRouterReplayState.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
+            else:
+                raise ValueError(f"Unsupported predictive_train_mode: {predictive_train_mode}")
 
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
@@ -642,6 +665,9 @@ def train(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     parallel_state: ParallelState,
+    predictive_train_mode: str = "compute",
+    train_pass_index: int = 0,
+    num_train_passes: int = 1,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -736,6 +762,7 @@ def train(
             opt_param_scheduler,
             num_microbatches[step_id],
             parallel_state,
+            predictive_train_mode=predictive_train_mode,
         )
 
         if step_id == 0:
@@ -782,6 +809,8 @@ def train(
             if args.enable_mtp_training:
                 extra_metrics["mtp_loss"] = mtp_losses
             extra_metrics.update(predictive_metrics)
+            if num_train_passes > 1 and role == "actor":
+                extra_metrics["predictive_train_pass"] = train_pass_index + 1
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 extra_metrics[f"lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
@@ -793,6 +822,8 @@ def train(
                 rollout_id=rollout_id,
                 step_id=step_id,
                 num_steps_per_rollout=num_steps_per_rollout,
+                train_pass_index=train_pass_index,
+                num_train_passes=num_train_passes,
                 role=role,
                 extra_metrics=extra_metrics,
                 should_log=True,

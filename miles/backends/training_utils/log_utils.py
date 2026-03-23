@@ -13,6 +13,7 @@ from miles.utils.metric_utils import compute_pass_rate, compute_rollout_step
 from miles.utils.types import RolloutBatch
 
 from ...utils import tracking_utils
+from ..megatron_utils.predictive_train_schedule import get_rollout_train_step_id
 from .cp_utils import get_sum_of_sample_mean
 from .data import DataIterator
 from .parallel import ParallelState
@@ -398,6 +399,8 @@ def log_train_step(
     rollout_id: int,
     step_id: int,
     num_steps_per_rollout: int,
+    train_pass_index: int = 0,
+    num_train_passes: int = 1,
     role: str = "actor",
     extra_metrics: dict[str, float] | None = None,
     should_log: bool | None = None,
@@ -420,7 +423,13 @@ def log_train_step(
     Returns:
         The formatted log_dict (for CI tests or other uses).
     """
-    accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
+    accumulated_step_id = get_rollout_train_step_id(
+        rollout_id=rollout_id,
+        step_id=step_id,
+        num_steps_per_rollout=num_steps_per_rollout,
+        train_pass_index=train_pass_index,
+        num_train_passes=num_train_passes,
+    )
     role_tag = "" if role == "actor" else f"{role}-"
 
     log_dict_out = {
