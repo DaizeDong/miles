@@ -8,7 +8,7 @@ Date: 2026-03-23
 ## Progress Tracker
 
 - Phase A: completed
-- Phase B: pending
+- Phase B: completed
 - Phase C: pending
 - Phase D: pending
 - Phase E: pending
@@ -28,6 +28,13 @@ Date: 2026-03-23
     passed
   - `pytest` is not installed in the current shell environment, so the new
     pytest module was verified statically and with direct smoke execution only
+- 2026-03-23: Completed Phase B. Added a pure predictive runtime state module
+  and a pure data utility module for valid-mask construction, downsampling,
+  restore-to-full-batch, and train-time tensor preparation.
+- 2026-03-23: Phase B verification status:
+  - `python -m compileall miles/backends/megatron_utils/predictive_router_replay.py miles/backends/megatron_utils/predictive_router_utils.py tests/fast/backends/megatron_utils/test_predictive_router_utils.py`
+  - current shell Python is missing `torch`, so the new tensor-level fast test
+    module could not be executed locally and was only syntax-checked
 
 ## 1. Goal
 
@@ -182,6 +189,10 @@ Acceptance criteria:
 ### Phase B: Predictive Runtime Primitive
 
 Create a dedicated predictive runtime layer for `miles`.
+
+Status:
+
+- completed on 2026-03-23
 
 Recommended new file:
 
