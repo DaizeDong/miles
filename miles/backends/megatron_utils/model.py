@@ -1,5 +1,7 @@
+import copy
 import dataclasses
 import gc
+import inspect
 import logging
 import math
 from argparse import Namespace
@@ -13,7 +15,12 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+try:
+    from megatron.core.optimizer import OptimizerConfig, ParamKey, get_megatron_optimizer
+except ImportError:
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+
+    ParamKey = None
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -39,12 +46,30 @@ from .initialize import is_megatron_main_rank
 from .lora_utils import is_lora_enabled, is_lora_model
 from .model_provider import get_model_provider_func
 from .parallel import get_packed_seq_params
+from .predictive_router_replay import apply_predictive_router_replay_patch, initialize_predictive_router_modules
 
 logger = logging.getLogger(__name__)
 
 
 from .bridge_lora_helpers import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 from .lora_utils import save_lora_checkpoint
+
+
+def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig, role: str) -> dict | None:
+    if role != "actor" or not getattr(args, "enable_predictive_routing_replay", False):
+        return None
+    if ParamKey is None:
+        raise RuntimeError("Predictive routing replay requires megatron.core.optimizer.ParamKey support.")
+
+    bias_predictor_optim_config = copy.deepcopy(config)
+    bias_predictor_optim_config.lr = config.lr * args.bias_predictor_lr_mult
+    logger.info(
+        "[Predictive Routing Replay] Bias predictor optimizer override enabled: base_lr=%s lr_mult=%s predictor_lr=%s",
+        config.lr,
+        args.bias_predictor_lr_mult,
+        bias_predictor_optim_config.lr,
+    )
+    return {ParamKey(attr="is_bias_predictor"): bias_predictor_optim_config}
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -119,10 +144,20 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
+    if role == "actor" and getattr(args, "enable_predictive_routing_replay", False):
+        apply_predictive_router_replay_patch()
+
     if is_lora_enabled(args) and role == "actor" and args.megatron_to_hf_mode == "bridge":
         model = _setup_lora_model_via_bridge(args)
     else:
         model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+
+    initialize_predictive_router_modules(
+        model_chunks=model,
+        enabled=role == "actor" and getattr(args, "enable_predictive_routing_replay", False),
+        loss_type=getattr(args, "bias_predictor_loss_type", "kl"),
+        lr_mult=getattr(args, "bias_predictor_lr_mult", 1.0),
+    )
 
     # Optimizer
     kwargs = {}
@@ -131,11 +166,20 @@ def setup_model_and_optimizer(
             kwargs[f.name] = getattr(args, f.name)
     config = OptimizerConfig(**kwargs)
     config.timers = None
-    optimizer = get_megatron_optimizer(
-        config=config,
-        model_chunks=model,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
-    )
+    optimizer_kwargs = {
+        "config": config,
+        "model_chunks": model,
+        "use_gloo_process_groups": args.enable_gloo_process_groups,
+    }
+    config_overrides = _build_optimizer_config_overrides(args, config, role)
+    if config_overrides is not None:
+        optimizer_signature = inspect.signature(get_megatron_optimizer)
+        if "config_overrides" not in optimizer_signature.parameters:
+            raise RuntimeError(
+                "Predictive routing replay requires Megatron get_megatron_optimizer to support config_overrides."
+            )
+        optimizer_kwargs["config_overrides"] = config_overrides
+    optimizer = get_megatron_optimizer(**optimizer_kwargs)
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
 

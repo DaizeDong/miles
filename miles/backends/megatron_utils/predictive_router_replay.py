@@ -3,6 +3,7 @@ from enum import Enum
 from typing import ClassVar
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,148 @@ def build_synthetic_predictive_loss(
 ) -> torch.Tensor:
     synthetic_delta_logits = bias_predictor(input_tensor.detach())
     return (synthetic_delta_logits * 0.0).sum()
+
+
+def _iter_module_chunks(model_chunks):
+    if isinstance(model_chunks, torch.nn.Module):
+        model_chunks = [model_chunks]
+    for model_chunk in model_chunks:
+        yield getattr(model_chunk, "module", model_chunk)
+
+
+def _build_bias_predictor(router) -> nn.Linear:
+    gating_weight = getattr(router.gating, "weight", None)
+    if gating_weight is not None:
+        in_features = gating_weight.shape[1]
+        out_features = gating_weight.shape[0]
+        device = gating_weight.device
+        dtype = gating_weight.dtype
+    else:
+        in_features = router.config.hidden_size
+        out_features = router.config.num_moe_experts
+        device = None
+        dtype = None
+
+    bias_predictor = nn.Linear(in_features=in_features, out_features=out_features, bias=False)
+    nn.init.zeros_(bias_predictor.weight)
+    if device is not None or dtype is not None:
+        bias_predictor = bias_predictor.to(device=device, dtype=dtype)
+
+    for param in bias_predictor.parameters():
+        setattr(param, "is_bias_predictor", True)
+        setattr(param, "allreduce", True)
+        setattr(param, "sequence_parallel", False)
+        setattr(param, "tensor_model_parallel", False)
+        setattr(param, "partition_dim", 0)
+        setattr(param, "partition_stride", 1)
+
+    return bias_predictor
+
+
+def initialize_predictive_router_modules(
+    *,
+    model_chunks,
+    enabled: bool,
+    loss_type: str,
+    lr_mult: float,
+) -> None:
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    PredictiveRouterReplayState.reset_registry()
+
+    seen_modules = set()
+    for module_chunk in _iter_module_chunks(model_chunks):
+        for submodule in module_chunk.modules():
+            if not isinstance(submodule, TopKRouter):
+                continue
+            if id(submodule) in seen_modules:
+                continue
+            seen_modules.add(id(submodule))
+
+            submodule.config.enable_router_bias_predictor = enabled
+            submodule.config.bias_predictor_loss_type = loss_type
+            submodule.config.bias_predictor_lr_mult = lr_mult
+
+            if not enabled:
+                submodule.predictive_router_replay = None
+                if hasattr(submodule, "bias_predictor"):
+                    submodule.bias_predictor = None
+                continue
+
+            PredictiveRouterReplayState.register_router(submodule)
+            submodule.bias_predictor = _build_bias_predictor(submodule)
+
+
+def apply_predictive_router_replay_patch() -> None:
+    from megatron.core.transformer.moe.moe_utils import apply_random_logits
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    if hasattr(TopKRouter, "_predictive_router_replay_patched"):
+        return
+
+    original_forward = TopKRouter.forward
+
+    def patched_forward(self, input: torch.Tensor):
+        predictive_state = getattr(self, "predictive_router_replay", None)
+        bias_predictor = getattr(self, "bias_predictor", None)
+
+        if predictive_state is None or bias_predictor is None:
+            return original_forward(self, input)
+
+        predictive_action = predictive_state.predictive_action
+        if predictive_action in {None, RouterPredictiveAction.DISABLED, RouterPredictiveAction.SKIP_PREDICTIVE}:
+            return original_forward(self, input)
+
+        self._maintain_float32_expert_bias()
+        input = self.apply_input_jitter(input)
+        logits = self.gating(input)
+
+        if self.config.moe_router_force_load_balancing:
+            logits = apply_random_logits(logits)
+
+        if predictive_action == RouterPredictiveAction.RECORD:
+            with torch.no_grad():
+                predictive_state.record_predictive_data(input, logits)
+                predicted_delta_logits = bias_predictor(input)
+                PredictiveRouterReplayState.record_predictive_bias_ratio(
+                    predictive_state.layer_idx,
+                    compute_predictive_bias_ratio(predicted_delta_logits, logits),
+                )
+            return self.routing(logits + predicted_delta_logits)
+
+        if predictive_action != RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS:
+            raise ValueError(f"Unsupported predictive router action: {predictive_action}")
+
+        old_inputs, old_logits, valid_mask = predictive_state.get_predictive_data()
+        if predictive_state.has_valid_predictive_data():
+            old_inputs = old_inputs.to(device=input.device, dtype=input.dtype)
+            old_logits = old_logits.to(device=logits.device, dtype=logits.dtype)
+            current_logits = logits
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(device=input.device)
+                current_logits = logits[valid_mask]
+            predicted_delta_logits = bias_predictor(old_inputs)
+            predictive_loss = compute_predictive_loss(
+                old_logits=old_logits,
+                current_logits=current_logits,
+                predicted_delta_logits=predicted_delta_logits,
+                loss_type=self.config.bias_predictor_loss_type,
+            )
+            PredictiveRouterReplayState.record_predictive_loss(predictive_state.layer_idx, predictive_loss.item())
+            PredictiveRouterReplayState.record_predictive_topk_accuracy(
+                predictive_state.layer_idx,
+                calculate_topk_accuracy(topk=self.topk, logits1=old_logits + predicted_delta_logits, logits2=current_logits),
+            )
+        else:
+            predictive_loss = build_synthetic_predictive_loss(bias_predictor=bias_predictor, input_tensor=input)
+
+        probs, routing_map = self.routing(logits)
+        predictive_loss.backward()
+        predictive_state.clear_predictive_data()
+        return probs, routing_map
+
+    TopKRouter.forward = patched_forward
+    TopKRouter._predictive_router_replay_patched = True
 
 
 class PredictiveRouterReplayState:
