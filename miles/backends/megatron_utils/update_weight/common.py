@@ -10,6 +10,7 @@ from megatron.core import mpu
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from miles.backends.megatron_utils.misc_utils import strip_param_name_prefix
+from miles.backends.megatron_utils.predictive_router_replay import is_predictive_router_parameter_name
 from miles.utils.types import ParamInfo
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,24 @@ def named_params_and_buffers(
         ans = ((name, _maybe_get_cpu_backup(tensor)) for name, tensor in ans)
 
     return ans
+
+
+def rollout_sync_named_params_and_buffers(
+    args: Namespace,
+    model: Sequence[torch.nn.Module],
+    convert_to_global_name: bool = True,
+    translate_gpu_to_cpu: bool = False,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    return (
+        (name, tensor)
+        for name, tensor in named_params_and_buffers(
+            args,
+            model,
+            convert_to_global_name=convert_to_global_name,
+            translate_gpu_to_cpu=translate_gpu_to_cpu,
+        )
+        if not is_predictive_router_parameter_name(name)
+    )
 
 
 def _maybe_get_cpu_backup(x: torch.Tensor):

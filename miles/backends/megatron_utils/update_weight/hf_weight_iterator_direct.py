@@ -12,7 +12,7 @@ from miles.utils.types import ParamInfo
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import monkey_patch_torch_reductions
-from .common import all_gather_params_async, named_params_and_buffers
+from .common import all_gather_params_async, rollout_sync_named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
 
@@ -148,7 +148,7 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
 
     param_infos = {}
     rank = dist.get_rank()
-    for name, param in named_params_and_buffers(args, model):
+    for name, param in rollout_sync_named_params_and_buffers(args, model):
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,

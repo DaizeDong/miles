@@ -1,4 +1,5 @@
 import logging
+from contextlib import contextmanager
 from enum import Enum
 from typing import ClassVar
 
@@ -14,6 +15,10 @@ class RouterPredictiveAction(str, Enum):
     RECORD = "record"
     SKIP_PREDICTIVE = "skip_predictive"
     COMPUTE_PREDICTIVE_LOSS = "compute_predictive_loss"
+
+
+def is_predictive_router_parameter_name(name: str) -> bool:
+    return "bias_predictor" in name
 
 
 def calculate_topk_accuracy(
@@ -225,6 +230,104 @@ def apply_predictive_router_replay_patch() -> None:
     TopKRouter._predictive_router_replay_patched = True
 
 
+@contextmanager
+def predictive_action_scope(action: RouterPredictiveAction):
+    PredictiveRouterReplayState.set_global_predictive_action(action)
+    try:
+        yield
+    finally:
+        PredictiveRouterReplayState.clear_global_predictive_action()
+
+
+class PredictiveRouterReplayBuffer:
+    microbatches: ClassVar[list[object]] = []
+    train_index: ClassVar[int] = 0
+
+    @classmethod
+    def clear(cls) -> None:
+        cls.microbatches.clear()
+        cls.train_index = 0
+
+    @classmethod
+    def append(cls, microbatch_data) -> None:
+        cls.microbatches.append(microbatch_data)
+
+    @classmethod
+    def reset_train_cursor(cls) -> None:
+        cls.train_index = 0
+
+    @classmethod
+    def pop_next(cls):
+        if cls.train_index >= len(cls.microbatches):
+            raise IndexError(
+                f"Predictive replay buffer underflow: train_index={cls.train_index}, buffered={len(cls.microbatches)}"
+            )
+        microbatch_data = cls.microbatches[cls.train_index]
+        cls.train_index += 1
+        return microbatch_data
+
+    @classmethod
+    def buffered_microbatch_count(cls) -> int:
+        return len(cls.microbatches)
+
+    @classmethod
+    def remaining_microbatch_count(cls) -> int:
+        return len(cls.microbatches) - cls.train_index
+
+
+class PredictiveTrainStepState:
+    used_valid_predictive_data: ClassVar[bool] = False
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.used_valid_predictive_data = False
+
+    @classmethod
+    def mark_used(cls) -> None:
+        cls.used_valid_predictive_data = True
+
+
+def _is_predictive_param_group(param_group: dict) -> bool:
+    return any(getattr(param, "is_bias_predictor", False) for param in param_group.get("params", []))
+
+
+def clear_predictive_optimizer_grads(optimizer) -> None:
+    for param_group in optimizer.param_groups:
+        if not _is_predictive_param_group(param_group):
+            continue
+        for param in param_group["params"]:
+            if not getattr(param, "is_bias_predictor", False):
+                continue
+            param.grad = None
+            if hasattr(param, "main_grad") and param.main_grad is not None:
+                param.main_grad.zero_()
+
+
+def disable_predictive_param_groups(optimizer) -> list[dict[str, object]]:
+    saved_group_states = []
+    for param_group in optimizer.param_groups:
+        if not _is_predictive_param_group(param_group):
+            continue
+        saved_state = {"group": param_group}
+        if "lr" in param_group:
+            saved_state["lr"] = param_group["lr"]
+            param_group["lr"] = 0.0
+        if "weight_decay" in param_group:
+            saved_state["weight_decay"] = param_group["weight_decay"]
+            param_group["weight_decay"] = 0.0
+        saved_group_states.append(saved_state)
+    return saved_group_states
+
+
+def restore_predictive_param_groups(saved_group_states: list[dict[str, object]]) -> None:
+    for saved_state in saved_group_states:
+        param_group = saved_state["group"]
+        if "lr" in saved_state:
+            param_group["lr"] = saved_state["lr"]
+        if "weight_decay" in saved_state:
+            param_group["weight_decay"] = saved_state["weight_decay"]
+
+
 class PredictiveRouterReplayState:
     router_instances: ClassVar[list["PredictiveRouterReplayState"]] = []
     predictive_loss_tracker: ClassVar[list[tuple[int, float]]] = []
@@ -311,6 +414,12 @@ class PredictiveRouterReplayState:
     def clear_global_predictive_action(cls) -> None:
         for router in cls.router_instances:
             router.clear_predictive_action()
+
+    @classmethod
+    def get_global_predictive_action(cls) -> RouterPredictiveAction:
+        if not cls.router_instances:
+            return RouterPredictiveAction.DISABLED
+        return cls.router_instances[0].predictive_action
 
     @classmethod
     def clear_global_predictive_data(cls) -> None:

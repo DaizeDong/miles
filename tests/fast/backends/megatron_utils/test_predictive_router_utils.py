@@ -1,14 +1,21 @@
+from types import SimpleNamespace
+
 import torch
 
 from miles.backends.megatron_utils.predictive_router_replay import (
+    PredictiveRouterReplayBuffer,
     PredictiveRouterReplayState,
     RouterPredictiveAction,
     calculate_topk_accuracy,
+    clear_predictive_optimizer_grads,
     compute_predictive_bias_ratio,
     compute_predictive_loss,
+    disable_predictive_param_groups,
+    restore_predictive_param_groups,
 )
 from miles.backends.megatron_utils.predictive_router_utils import (
     build_predictive_valid_mask,
+    pack_recorded_predictive_microbatch,
     prepare_predictive_router_data,
     restore_predictive_samples,
     select_predictive_samples,
@@ -115,6 +122,57 @@ def test_select_predictive_samples_falls_back_to_shortest_sequences():
 
     assert selection.sampled_indices == [1, 2]
     assert selection.sampled_mask.tolist() == [False, True, True]
+
+
+def test_select_predictive_samples_skips_zero_length_entries():
+    old_inputs_list = [
+        torch.randn(0, 2, 3),
+        torch.randn(2, 2, 3),
+    ]
+    old_logits_list = [
+        torch.randn(0, 2, 5),
+        torch.randn(2, 2, 5),
+    ]
+
+    selection = select_predictive_samples(
+        old_inputs_list=old_inputs_list,
+        old_logits_list=old_logits_list,
+        downsample_batch_size=1,
+    )
+
+    assert selection.sampled_indices == [1]
+    assert selection.sampled_mask.tolist() == [False, True]
+
+
+def test_pack_recorded_predictive_microbatch_builds_mask_and_storage():
+    parallel_state = SimpleNamespace(cp_rank=0, cp_size=1)
+    recorded_old_inputs = [
+        torch.arange(18, dtype=torch.float32).reshape(6, 3),
+        torch.arange(18, 36, dtype=torch.float32).reshape(6, 3),
+    ]
+    recorded_old_logits = [
+        torch.arange(24, dtype=torch.float32).reshape(6, 4),
+        torch.arange(24, 48, dtype=torch.float32).reshape(6, 4),
+    ]
+
+    packed = pack_recorded_predictive_microbatch(
+        recorded_old_inputs=recorded_old_inputs,
+        recorded_old_logits=recorded_old_logits,
+        total_lengths=[2, 4],
+        parallel_state=parallel_state,
+        qkv_format="thd",
+        downsample_batch_size=1,
+        max_len_limit=2,
+        storage_dtype="fp16",
+    )
+
+    assert packed.sample_lengths == [2, 4]
+    assert packed.sampled_indices == [0]
+    assert packed.valid_mask.tolist() == [True, True, False, False, False, False]
+    assert packed.old_inputs_concat.dtype == torch.float16
+    assert packed.old_logits_concat.dtype == torch.float16
+    assert packed.old_inputs_concat.shape == torch.Size([2, 2, 3])
+    assert packed.old_logits_concat.shape == torch.Size([2, 2, 4])
 
 
 def test_prepare_predictive_router_data_trims_to_current_lengths():
@@ -228,6 +286,50 @@ def test_predictive_router_replay_registry_and_metrics():
     PredictiveRouterReplayState.clear_global_predictive_action()
     assert state0.predictive_action == RouterPredictiveAction.DISABLED
     assert state1.predictive_action == RouterPredictiveAction.DISABLED
+
+
+def test_predictive_router_replay_buffer_cursor():
+    PredictiveRouterReplayBuffer.clear()
+    PredictiveRouterReplayBuffer.append("mb0")
+    PredictiveRouterReplayBuffer.append("mb1")
+
+    assert PredictiveRouterReplayBuffer.buffered_microbatch_count() == 2
+    assert PredictiveRouterReplayBuffer.pop_next() == "mb0"
+    assert PredictiveRouterReplayBuffer.pop_next() == "mb1"
+
+    PredictiveRouterReplayBuffer.clear()
+    assert PredictiveRouterReplayBuffer.buffered_microbatch_count() == 0
+
+
+def test_predictive_optimizer_group_disable_and_restore():
+    predictor_param = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+    predictor_param.is_bias_predictor = True
+    predictor_param.grad = torch.ones_like(predictor_param)
+    predictor_param.main_grad = torch.ones_like(predictor_param)
+
+    normal_param = torch.nn.Parameter(torch.ones(2, dtype=torch.float32))
+    normal_param.grad = torch.ones_like(normal_param)
+
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {"params": [predictor_param], "lr": 3.0, "weight_decay": 0.1},
+            {"params": [normal_param], "lr": 1.0, "weight_decay": 0.01},
+        ]
+    )
+
+    clear_predictive_optimizer_grads(optimizer)
+    assert predictor_param.grad is None
+    assert torch.equal(predictor_param.main_grad, torch.zeros_like(predictor_param.main_grad))
+    assert normal_param.grad is not None
+
+    saved_groups = disable_predictive_param_groups(optimizer)
+    assert optimizer.param_groups[0]["lr"] == 0.0
+    assert optimizer.param_groups[0]["weight_decay"] == 0.0
+    assert optimizer.param_groups[1]["lr"] == 1.0
+
+    restore_predictive_param_groups(saved_groups)
+    assert optimizer.param_groups[0]["lr"] == 3.0
+    assert optimizer.param_groups[0]["weight_decay"] == 0.1
 
 
 def test_compute_predictive_loss_variants_and_metrics():

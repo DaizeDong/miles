@@ -36,6 +36,12 @@ from .initialize import init, is_megatron_main_rank
 from .lora_utils import is_lora_enabled
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .parallel import create_megatron_parallel_state
+from .predictive_router_replay import (
+    PredictiveRouterReplayBuffer,
+    PredictiveRouterReplayState,
+    RouterPredictiveAction,
+    predictive_action_scope,
+)
 from .replay_utils import get_register_replay_list_func
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -282,18 +288,23 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator: list[DataIterator],
         num_microbatches: list[int],
         store_prefix: str = "",
+        enable_predictive_record: bool = False,
     ) -> dict[str, list[torch.Tensor]]:
 
         with timer(f"{store_prefix}log_probs"):
-            return forward_only(
-                get_log_probs_and_entropy,
-                self.args,
-                self.model,
-                data_iterator,
-                num_microbatches,
-                self.parallel_state,
-                store_prefix=store_prefix,
+            predictive_context = (
+                predictive_action_scope(RouterPredictiveAction.RECORD) if enable_predictive_record else nullcontext()
             )
+            with predictive_context:
+                return forward_only(
+                    get_log_probs_and_entropy,
+                    self.args,
+                    self.model,
+                    data_iterator,
+                    num_microbatches,
+                    self.parallel_state,
+                    store_prefix=store_prefix,
+                )
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         self._last_rollout_id = rollout_id
@@ -347,6 +358,16 @@ class MegatronTrainRayActor(TrainRayActor):
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, self.parallel_state, rollout_data)
+        predictive_enabled = getattr(self.args, "enable_predictive_routing_replay", False)
+        if predictive_enabled and not self.args.compute_advantages_and_returns:
+            raise RuntimeError(
+                "Predictive routing replay requires compute_advantages_and_returns in Miles so old actor logprobs "
+                "are available before the actor train step."
+            )
+        if predictive_enabled:
+            PredictiveRouterReplayBuffer.clear()
+            PredictiveRouterReplayState.clear_global_predictive_data()
+            PredictiveRouterReplayState.clear_global_predictive_action()
 
         for m in all_replay_managers:
             if self._use_rollout_replay(m):
@@ -373,7 +394,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
                 self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
-                if not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
+                if predictive_enabled or not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics:
                     for m in all_replay_managers:
                         if m.enabled:
                             if self._use_rollout_replay(m):
@@ -385,8 +406,11 @@ class MegatronTrainRayActor(TrainRayActor):
                             data_iterator,
                             num_microbatches,
                             store_prefix="",
+                            enable_predictive_record=predictive_enabled,
                         )
                     )
+                    if predictive_enabled:
+                        PredictiveRouterReplayBuffer.reset_train_cursor()
                     for m in all_replay_managers:
                         if self._use_rollout_replay(m):
                             m.clear_all_forward()
@@ -421,6 +445,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                     self.parallel_state,
                 )
+                if predictive_enabled and PredictiveRouterReplayBuffer.remaining_microbatch_count() != 0:
+                    raise RuntimeError(
+                        "Predictive routing replay buffer was not fully consumed during actor training: "
+                        f"remaining={PredictiveRouterReplayBuffer.remaining_microbatch_count()}"
+                    )
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -429,6 +458,10 @@ class MegatronTrainRayActor(TrainRayActor):
         for m in all_replay_managers:
             if m.enabled:
                 m.clear_all()
+        if predictive_enabled:
+            PredictiveRouterReplayBuffer.clear()
+            PredictiveRouterReplayState.clear_global_predictive_data()
+            PredictiveRouterReplayState.clear_global_predictive_action()
 
         # update the cpu actor weight to the latest model
         self.weights_backuper.backup("actor")

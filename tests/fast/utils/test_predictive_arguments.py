@@ -102,6 +102,7 @@ def _make_validation_args(**overrides):
         "train_backend": "megatron",
         "use_routing_replay": False,
         "use_rollout_routing_replay": False,
+        "allgather_cp": False,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -179,6 +180,17 @@ def test_predictive_validation_requires_megatron():
     )
 
     with pytest.raises(AssertionError, match="megatron backend"):
+        _validate_predictive_routing_replay_args(args)
+
+
+def test_predictive_validation_rejects_allgather_cp():
+    args = _make_validation_args(
+        enable_predictive_routing_replay=True,
+        use_routing_replay=True,
+        allgather_cp=True,
+    )
+
+    with pytest.raises(AssertionError, match="allgather-cp"):
         _validate_predictive_routing_replay_args(args)
 
 

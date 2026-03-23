@@ -46,7 +46,18 @@ from .initialize import is_megatron_main_rank
 from .lora_utils import is_lora_enabled, is_lora_model
 from .model_provider import get_model_provider_func
 from .parallel import get_packed_seq_params
-from .predictive_router_replay import apply_predictive_router_replay_patch, initialize_predictive_router_modules
+from .predictive_router_replay import (
+    PredictiveRouterReplayBuffer,
+    PredictiveRouterReplayState,
+    PredictiveTrainStepState,
+    RouterPredictiveAction,
+    apply_predictive_router_replay_patch,
+    clear_predictive_optimizer_grads,
+    disable_predictive_param_groups,
+    initialize_predictive_router_modules,
+    restore_predictive_param_groups,
+)
+from .predictive_router_utils import pack_recorded_predictive_microbatch
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +228,65 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
     return args.use_distributed_optimizer and args.overlap_param_gather
 
 
+def _predictive_router_enabled(args: Namespace, model: Sequence[DDP]) -> bool:
+    return (
+        getattr(args, "enable_predictive_routing_replay", False)
+        and getattr(model[0], "role", "actor") == "actor"
+        and bool(PredictiveRouterReplayState.get_router_instances())
+    )
+
+
+def _collect_recorded_predictive_microbatch(
+    args: Namespace,
+    parallel_state: ParallelState,
+    batch: dict[str, torch.Tensor | list[torch.Tensor] | None],
+) -> None:
+    router_states = PredictiveRouterReplayState.get_router_instances()
+    if not router_states:
+        return
+
+    recorded_old_inputs = []
+    recorded_old_logits = []
+    for router_state in router_states:
+        old_inputs, old_logits, _ = router_state.get_predictive_data()
+        if old_inputs is None or old_logits is None:
+            raise RuntimeError("Predictive RECORD mode did not capture router inputs/logits on every local router.")
+        recorded_old_inputs.append(old_inputs)
+        recorded_old_logits.append(old_logits)
+        router_state.clear_predictive_data()
+
+    PredictiveRouterReplayBuffer.append(
+        pack_recorded_predictive_microbatch(
+            recorded_old_inputs=recorded_old_inputs,
+            recorded_old_logits=recorded_old_logits,
+            total_lengths=batch["total_lengths"],
+            parallel_state=parallel_state,
+            qkv_format=args.qkv_format,
+            max_seq_lens=batch.get("max_seq_lens", None),
+            allgather_cp=args.allgather_cp,
+            downsample_batch_size=getattr(args, "predictive_downsample_batch_size", None),
+            max_len_limit=getattr(args, "predictive_downsample_max_len_limit", None),
+            storage_dtype=getattr(args, "predictive_storage_dtype", "bf16"),
+        )
+    )
+
+
+def _prepare_predictive_train_microbatch(args: Namespace) -> None:
+    predictive_microbatch = PredictiveRouterReplayBuffer.pop_next()
+    if predictive_microbatch.has_valid_samples:
+        PredictiveRouterReplayState.set_global_predictive_data(
+            old_inputs_concat=predictive_microbatch.old_inputs_concat,
+            old_logits_concat=predictive_microbatch.old_logits_concat,
+            valid_mask=predictive_microbatch.valid_mask,
+        )
+        PredictiveRouterReplayState.set_global_predictive_action(RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS)
+        PredictiveTrainStepState.mark_used()
+        return
+
+    PredictiveRouterReplayState.clear_global_predictive_data()
+    PredictiveRouterReplayState.set_global_predictive_action(RouterPredictiveAction.SKIP_PREDICTIVE)
+
+
 # ---------------------------------------------------------------------------
 # Forward-only inference
 # ---------------------------------------------------------------------------
@@ -253,6 +323,7 @@ def forward_only(
         iterator.reset()
 
     config = get_model_config(model[0])
+    predictive_router_enabled = _predictive_router_enabled(args, model)
 
     def forward_step(
         data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False
@@ -301,6 +372,12 @@ def forward_only(
             loss_mask=batch["full_loss_masks"],
             **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
         )
+
+        if (
+            predictive_router_enabled
+            and PredictiveRouterReplayState.get_global_predictive_action() == RouterPredictiveAction.RECORD
+        ):
+            _collect_recorded_predictive_microbatch(args, parallel_state, batch)
 
         return output_tensor, partial(
             f,
@@ -384,6 +461,9 @@ def train_one_step(
         Reduced loss dictionary (last stage only) and gradient norm for logging.
     """
     args = get_args()
+    predictive_router_enabled = _predictive_router_enabled(args, model)
+    if predictive_router_enabled:
+        PredictiveTrainStepState.reset()
 
     # Set grad to zero.
     for model_chunk in model:
@@ -442,6 +522,9 @@ def train_one_step(
         for m in all_replay_managers:
             m.stage = "replay_forward"
 
+        if predictive_router_enabled and not return_schedule_plan:
+            _prepare_predictive_train_microbatch(args)
+
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             output_tensor = model.build_schedule_plan(
@@ -468,7 +551,12 @@ def train_one_step(
             if batch["multimodal_train_inputs"] is not None:
                 forward_kwargs.update(batch["multimodal_train_inputs"])
 
-            output_tensor = model(**forward_kwargs)
+            try:
+                output_tensor = model(**forward_kwargs)
+            finally:
+                if predictive_router_enabled:
+                    PredictiveRouterReplayState.clear_global_predictive_action()
+                    PredictiveRouterReplayState.clear_global_predictive_data()
 
         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):
             m.stage = old_stage
@@ -512,11 +600,19 @@ def train_one_step(
 
     if valid_step:
         # Update parameters.
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        disabled_predictive_groups = []
+        if predictive_router_enabled and not PredictiveTrainStepState.used_valid_predictive_data:
+            clear_predictive_optimizer_grads(optimizer)
+            disabled_predictive_groups = disable_predictive_param_groups(optimizer)
+        try:
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
-        # Update learning rate.
-        assert update_successful
-        opt_param_scheduler.step(increment=args.global_batch_size)
+            # Update learning rate.
+            assert update_successful
+            opt_param_scheduler.step(increment=args.global_batch_size)
+        finally:
+            if disabled_predictive_groups:
+                restore_predictive_param_groups(disabled_predictive_groups)
 
     # release grad
     for model_chunk in model:
@@ -672,6 +768,10 @@ def train(
 
                     check_mtp_loss(mtp_losses)
 
+        predictive_metrics = {}
+        if _predictive_router_enabled(args, model):
+            predictive_metrics = PredictiveRouterReplayState.get_and_clear_predictive_metrics()
+
         # per train step log.
         if is_megatron_main_rank():
             accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
@@ -681,6 +781,7 @@ def train(
             extra_metrics = {}
             if args.enable_mtp_training:
                 extra_metrics["mtp_loss"] = mtp_losses
+            extra_metrics.update(predictive_metrics)
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 extra_metrics[f"lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
