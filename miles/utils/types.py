@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from enum import Enum
+from numbers import Number
 from typing import Any
 
 import numpy
@@ -143,7 +144,25 @@ class Sample:
         return sample
 
     def get_reward_value(self, args) -> float:
-        return self.reward if not args.reward_key else self.reward[args.reward_key]
+        reward = self.reward
+        reward_key = getattr(args, "reward_key", None)
+
+        if reward_key:
+            return reward[reward_key]
+
+        if isinstance(reward, dict):
+            if "score" in reward and isinstance(reward["score"], Number):
+                return float(reward["score"])
+
+            numeric_items = [value for value in reward.values() if isinstance(value, Number)]
+            if len(numeric_items) == 1:
+                return float(numeric_items[0])
+
+            raise TypeError(
+                "Reward is a dict but no reward_key was provided, and a default numeric score could not be inferred."
+            )
+
+        return float(reward)
 
     @property
     def effective_response_length(self):

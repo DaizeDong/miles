@@ -602,6 +602,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
             parser.add_argument(
+                "--prompt-truncation",
+                type=str,
+                choices=("none", "left", "right"),
+                default="none",
+                help=(
+                    "How to handle prompts longer than the configured max prompt length. "
+                    "'none' keeps the existing Miles behavior and filters them out; "
+                    "'left' or 'right' truncates prompt tokens before dataset creation."
+                ),
+            )
+            parser.add_argument(
                 "--chat-template-path",
                 type=str,
                 default=None,

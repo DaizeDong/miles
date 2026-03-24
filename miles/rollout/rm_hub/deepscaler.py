@@ -7,7 +7,11 @@ def get_deepscaler_rule_based_reward(response, label):
     elif "###Response" in response:
         model_solution = response.split("###Response")[1]
     else:
-        return 0
+        # DeepScaler-style models usually delimit the final answer with an explicit
+        # thinking boundary. Base / instruct models often answer directly without
+        # those markers, so fall back to scoring the full response instead of
+        # assigning a spurious zero reward to every sample.
+        model_solution = response
 
     model_answer = extract_answer(model_solution)
     if model_answer is None:

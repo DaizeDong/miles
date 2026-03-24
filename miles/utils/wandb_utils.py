@@ -19,6 +19,27 @@ def _is_offline_mode(args) -> bool:
     return os.environ.get("WANDB_MODE") == "offline"
 
 
+def _resolve_wandb_key(args):
+    if args.wandb_key:
+        return args.wandb_key
+    return os.environ.get("WANDB_API_KEY")
+
+
+def _resolve_wandb_group(args):
+    return args.wandb_group or args.wandb_project or "miles"
+
+
+def _resolve_wandb_run_name(args, group):
+    run_name = getattr(args, "wandb_run_name", None)
+    if run_name:
+        return run_name
+
+    if args.wandb_random_suffix:
+        return f"{group}_{wandb.util.generate_id()}-RANK_{args.rank}"
+
+    return group
+
+
 def init_wandb_primary(args):
     if not args.use_wandb:
         args.wandb_run_id = None
@@ -37,17 +58,17 @@ def init_wandb_primary(args):
     offline = _is_offline_mode(args)
 
     # Only perform explicit login when NOT offline
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+    wandb_key = _resolve_wandb_key(args)
+    if (not offline) and wandb_key is not None:
+        wandb.login(key=wandb_key, host=args.wandb_host)
 
-    # Prepare wandb init parameters
-    # add random 6 length string with characters
-    if args.wandb_random_suffix:
-        group = args.wandb_group + "_" + wandb.util.generate_id()
-        run_name = f"{group}-RANK_{args.rank}"
-    else:
-        group = args.wandb_group
-        run_name = args.wandb_group
+    # Keep the W&B group stable and only vary the run name.
+    # This matches the documented behavior of --disable-wandb-random-suffix,
+    # and allows multiple runs of the same model to aggregate under one group.
+    group = _resolve_wandb_group(args)
+    run_name = _resolve_wandb_run_name(args, group)
+    args.wandb_group_resolved = group
+    args.wandb_run_name = run_name
 
     # Prepare wandb init parameters
     init_kwargs = {
@@ -72,6 +93,13 @@ def init_wandb_primary(args):
         logger.info(f"W&B logs will be stored in: {args.wandb_dir}")
 
     wandb.init(**init_kwargs)
+    logger.info(
+        "Initialized primary W&B run: project=%s group=%s name=%s id=%s",
+        args.wandb_project,
+        group,
+        run_name,
+        wandb.run.id,
+    )
 
     _init_wandb_common()
 
@@ -103,8 +131,14 @@ def init_wandb_secondary(args, router_addr=None):
 
     offline = _is_offline_mode(args)
 
-    if (not offline) and args.wandb_key is not None:
-        wandb.login(key=args.wandb_key, host=args.wandb_host)
+    wandb_key = _resolve_wandb_key(args)
+    if (not offline) and wandb_key is not None:
+        wandb.login(key=wandb_key, host=args.wandb_host)
+
+    group = getattr(args, "wandb_group_resolved", None) or _resolve_wandb_group(args)
+    run_name = _resolve_wandb_run_name(args, group)
+    args.wandb_group_resolved = group
+    args.wandb_run_name = run_name
 
     # Configure settings based on offline/online mode
     if offline:
@@ -131,6 +165,8 @@ def init_wandb_secondary(args, router_addr=None):
         "id": wandb_run_id,
         "entity": args.wandb_team,
         "project": args.wandb_project,
+        "group": group,
+        "name": run_name,
         "config": args.__dict__,
         "resume": "allow",
         "reinit": True,
@@ -143,6 +179,13 @@ def init_wandb_secondary(args, router_addr=None):
         init_kwargs["dir"] = args.wandb_dir
 
     wandb.init(**init_kwargs)
+    logger.info(
+        "Initialized secondary W&B run: project=%s group=%s name=%s id=%s",
+        args.wandb_project,
+        group,
+        run_name,
+        wandb_run_id,
+    )
 
     _init_wandb_common()
 
