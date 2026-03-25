@@ -1186,8 +1186,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 dest="wandb_random_suffix",
                 default=True,
                 help=(
-                    "Whether to add a random suffix to the wandb run name. "
-                    "By default, we will add a random 6 length string with characters to the run name."
+                    "Whether to append a random suffix to the W&B experiment identity. "
+                    "By default, Miles creates a unique group per launch and names the primary run "
+                    "with that suffixed group plus the rank."
                 ),
             )
             parser.add_argument(

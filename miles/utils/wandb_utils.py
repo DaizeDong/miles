@@ -29,15 +29,24 @@ def _resolve_wandb_group(args):
     return args.wandb_group or args.wandb_project or "miles"
 
 
-def _resolve_wandb_run_name(args, group):
+def _resolve_wandb_identity(args):
+    group = getattr(args, "wandb_group_resolved", None)
     run_name = getattr(args, "wandb_run_name", None)
-    if run_name:
-        return run_name
+    if group is not None and run_name is not None:
+        return group, run_name
 
+    base_group = _resolve_wandb_group(args)
     if args.wandb_random_suffix:
-        return f"{group}_{wandb.util.generate_id()}-RANK_{args.rank}"
+        group = f"{base_group}_{wandb.util.generate_id()}"
+        default_run_name = f"{group}-RANK_{args.rank}"
+    else:
+        group = base_group
+        default_run_name = base_group
 
-    return group
+    run_name = run_name or default_run_name
+    args.wandb_group_resolved = group
+    args.wandb_run_name = run_name
+    return group, run_name
 
 
 def init_wandb_primary(args):
@@ -62,13 +71,7 @@ def init_wandb_primary(args):
     if (not offline) and wandb_key is not None:
         wandb.login(key=wandb_key, host=args.wandb_host)
 
-    # Keep the W&B group stable and only vary the run name.
-    # This matches the documented behavior of --disable-wandb-random-suffix,
-    # and allows multiple runs of the same model to aggregate under one group.
-    group = _resolve_wandb_group(args)
-    run_name = _resolve_wandb_run_name(args, group)
-    args.wandb_group_resolved = group
-    args.wandb_run_name = run_name
+    group, run_name = _resolve_wandb_identity(args)
 
     # Prepare wandb init parameters
     init_kwargs = {
@@ -135,10 +138,7 @@ def init_wandb_secondary(args, router_addr=None):
     if (not offline) and wandb_key is not None:
         wandb.login(key=wandb_key, host=args.wandb_host)
 
-    group = getattr(args, "wandb_group_resolved", None) or _resolve_wandb_group(args)
-    run_name = _resolve_wandb_run_name(args, group)
-    args.wandb_group_resolved = group
-    args.wandb_run_name = run_name
+    group, run_name = _resolve_wandb_identity(args)
 
     # Configure settings based on offline/online mode
     if offline:
