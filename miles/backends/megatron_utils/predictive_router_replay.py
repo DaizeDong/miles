@@ -88,6 +88,30 @@ def build_synthetic_predictive_loss(
     return (synthetic_delta_logits * 0.0).sum()
 
 
+def _ensure_bias_predictor_runtime_placement(
+    *,
+    bias_predictor: nn.Module,
+    reference_tensor: torch.Tensor,
+) -> None:
+    target_device = reference_tensor.device
+    target_dtype = reference_tensor.dtype
+
+    for parameter in bias_predictor.parameters():
+        if parameter.device == target_device and parameter.dtype == target_dtype:
+            continue
+        parameter.data = parameter.data.to(device=target_device, dtype=target_dtype)
+        if parameter.grad is not None:
+            parameter.grad.data = parameter.grad.data.to(device=target_device, dtype=target_dtype)
+        main_grad = getattr(parameter, "main_grad", None)
+        if main_grad is not None:
+            parameter.main_grad = main_grad.to(device=target_device, dtype=target_dtype)
+
+    for buffer_name, buffer in bias_predictor.named_buffers():
+        if buffer.device == target_device and buffer.dtype == target_dtype:
+            continue
+        setattr(bias_predictor, buffer_name, buffer.to(device=target_device, dtype=target_dtype))
+
+
 def _iter_module_chunks(model_chunks):
     if isinstance(model_chunks, torch.nn.Module):
         model_chunks = [model_chunks]
@@ -174,6 +198,8 @@ def apply_predictive_router_replay_patch() -> None:
         if predictive_state is None or bias_predictor is None:
             return original_forward(self, input)
 
+        _ensure_bias_predictor_runtime_placement(bias_predictor=bias_predictor, reference_tensor=input)
+
         predictive_action = predictive_state.predictive_action
         if predictive_action in {None, RouterPredictiveAction.DISABLED, RouterPredictiveAction.SKIP_PREDICTIVE}:
             return original_forward(self, input)
@@ -214,20 +240,28 @@ def apply_predictive_router_replay_patch() -> None:
             if valid_mask is not None:
                 valid_mask = valid_mask.to(device=input.device, non_blocking=valid_mask.device.type == "cpu")
                 current_logits = logits[valid_mask]
-            predicted_delta_logits = bias_predictor(old_inputs)
-            predictive_loss = compute_predictive_loss(
-                old_logits=old_logits,
-                current_logits=current_logits,
-                predicted_delta_logits=predicted_delta_logits,
-                loss_type=self.config.bias_predictor_loss_type,
-            )
+            old_logits = old_logits.detach()
+            current_logits = current_logits.detach()
+            with torch.enable_grad():
+                predicted_delta_logits = bias_predictor(old_inputs.detach())
+                predictive_loss = compute_predictive_loss(
+                    old_logits=old_logits,
+                    current_logits=current_logits,
+                    predicted_delta_logits=predicted_delta_logits,
+                    loss_type=self.config.bias_predictor_loss_type,
+                )
             PredictiveRouterReplayState.record_predictive_loss(predictive_state.layer_idx, predictive_loss.item())
             PredictiveRouterReplayState.record_predictive_topk_accuracy(
                 predictive_state.layer_idx,
-                calculate_topk_accuracy(topk=self.topk, logits1=old_logits + predicted_delta_logits, logits2=current_logits),
+                calculate_topk_accuracy(
+                    topk=self.topk,
+                    logits1=old_logits + predicted_delta_logits.detach(),
+                    logits2=current_logits,
+                ),
             )
         else:
-            predictive_loss = build_synthetic_predictive_loss(bias_predictor=bias_predictor, input_tensor=input)
+            with torch.enable_grad():
+                predictive_loss = build_synthetic_predictive_loss(bias_predictor=bias_predictor, input_tensor=input)
 
         probs, routing_map = self.routing(logits)
         predictive_loss.backward()

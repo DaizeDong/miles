@@ -6,6 +6,8 @@ from miles.backends.megatron_utils.predictive_router_replay import (
     PredictiveRouterReplayBuffer,
     PredictiveRouterReplayState,
     RouterPredictiveAction,
+    _ensure_bias_predictor_runtime_placement,
+    build_synthetic_predictive_loss,
     calculate_topk_accuracy,
     clear_predictive_optimizer_grads,
     compute_predictive_bias_ratio,
@@ -379,3 +381,45 @@ def test_compute_predictive_loss_variants_and_metrics():
     assert kl_post_loss.item() >= 0
     assert compute_predictive_bias_ratio(predicted_delta_logits, old_logits) > 0
     assert calculate_topk_accuracy(topk=1, logits1=old_logits + predicted_delta_logits, logits2=current_logits) == 1.0
+
+
+def test_ensure_bias_predictor_runtime_placement_preserves_parameter_identity():
+    bias_predictor = torch.nn.Linear(4, 3, bias=False)
+    predictor_weight = bias_predictor.weight
+    predictor_weight.grad = torch.ones_like(predictor_weight)
+    predictor_weight.main_grad = torch.ones_like(predictor_weight)
+    reference_tensor = torch.randn(2, 4, dtype=torch.bfloat16)
+
+    _ensure_bias_predictor_runtime_placement(
+        bias_predictor=bias_predictor,
+        reference_tensor=reference_tensor,
+    )
+
+    assert bias_predictor.weight is predictor_weight
+    assert bias_predictor.weight.dtype == reference_tensor.dtype
+    assert bias_predictor.weight.grad.dtype == reference_tensor.dtype
+    assert bias_predictor.weight.main_grad.dtype == reference_tensor.dtype
+
+
+def test_predictive_losses_can_build_gradients_inside_enable_grad_scope():
+    bias_predictor = torch.nn.Linear(4, 3, bias=False).to(dtype=torch.bfloat16)
+    old_inputs = torch.randn(2, 4, dtype=torch.bfloat16)
+    old_logits = torch.randn(2, 3, dtype=torch.bfloat16)
+    current_logits = torch.randn(2, 3, dtype=torch.bfloat16)
+
+    with torch.no_grad():
+        with torch.enable_grad():
+            predicted_delta_logits = bias_predictor(old_inputs.detach())
+            predictive_loss = compute_predictive_loss(
+                old_logits=old_logits.detach(),
+                current_logits=current_logits.detach(),
+                predicted_delta_logits=predicted_delta_logits,
+                loss_type="kl-post",
+            )
+            synthetic_loss = build_synthetic_predictive_loss(
+                bias_predictor=bias_predictor,
+                input_tensor=old_inputs,
+            )
+
+    assert predictive_loss.requires_grad is True
+    assert synthetic_loss.requires_grad is True
