@@ -35,13 +35,11 @@ def _resolve_wandb_identity(args):
     if group is not None and run_name is not None:
         return group, run_name
 
-    base_group = _resolve_wandb_group(args)
+    group = _resolve_wandb_group(args)
     if args.wandb_random_suffix:
-        group = f"{base_group}_{wandb.util.generate_id()}"
-        default_run_name = f"{group}-RANK_{args.rank}"
+        default_run_name = f"{group}_{wandb.util.generate_id()}-RANK_{args.rank}"
     else:
-        group = base_group
-        default_run_name = base_group
+        default_run_name = group
 
     run_name = run_name or default_run_name
     args.wandb_group_resolved = group

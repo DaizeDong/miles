@@ -29,7 +29,7 @@ def test_random_suffix_creates_unique_group(monkeypatch):
 
     group, run_name = wandb_utils._resolve_wandb_identity(args)
 
-    assert group == "PREEXP-Qwen3-30B-A3B-Base_abc123"
+    assert group == "PREEXP-Qwen3-30B-A3B-Base"
     assert run_name == "PREEXP-Qwen3-30B-A3B-Base_abc123-RANK_0"
     assert args.wandb_group_resolved == group
     assert args.wandb_run_name == run_name
@@ -46,11 +46,11 @@ def test_disable_random_suffix_keeps_stable_group():
 
 def test_pre_resolved_identity_is_reused():
     args = _make_args(
-        wandb_group_resolved="PREEXP-Qwen3-30B-A3B-Base_existing",
-        wandb_run_name="PREEXP-Qwen3-30B-A3B-Base_existing-RANK_0",
+        wandb_group_resolved="off2-8nodes-r2",
+        wandb_run_name="off2-8nodes-r2_abc123-RANK_0",
     )
 
     group, run_name = wandb_utils._resolve_wandb_identity(args)
 
-    assert group == "PREEXP-Qwen3-30B-A3B-Base_existing"
-    assert run_name == "PREEXP-Qwen3-30B-A3B-Base_existing-RANK_0"
+    assert group == "off2-8nodes-r2"
+    assert run_name == "off2-8nodes-r2_abc123-RANK_0"
