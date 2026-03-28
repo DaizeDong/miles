@@ -193,3 +193,4 @@ _examples_synced/
 .env
 .DS_Store
 .claude/
+scripts_mine/wandb_key_sandy.txt

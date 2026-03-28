@@ -78,15 +78,21 @@ def _parse_generalized_path(s: str):
     return s, None
 
 
-def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_length: int | None) -> list[Sample]:
+def filter_long_prompt(
+    origin_samples: list[Sample],
+    tokenizer,
+    processor,
+    max_length: int | None,
+    prompt_truncation: str = "none",
+) -> list[Sample]:
     if max_length is None:
-        return False
+        return origin_samples
 
     if not isinstance(origin_samples[0].prompt, str):
         logger.warning(
-            "Skipping max_length check for list prompt. Set apply_chat_template=True to enable length filtering."
+            "Skipping max_length handling for list prompt. Set apply_chat_template=True to enable truncation/filtering."
         )
-        return False
+        return origin_samples
 
     if processor:
         filtered_samples = []
@@ -98,16 +104,48 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
             input_ids = processor_output["input_ids"][0]
             if len(input_ids) <= max_length:
                 filtered_samples.append(sample)
+        if prompt_truncation != "none":
+            logger.warning("Prompt truncation is not supported when processor is enabled; filtering long samples instead.")
     else:
         prompts = [sample.prompt for sample in origin_samples]
         input_ids_list = tokenizer(prompts, add_special_tokens=False)["input_ids"]
-        filtered_samples = [
-            sample
-            for sample, input_ids in zip(origin_samples, input_ids_list, strict=True)
-            if len(input_ids) <= max_length
-        ]
+        filtered_samples = []
+        truncated_count = 0
+        for sample, input_ids in zip(origin_samples, input_ids_list, strict=True):
+            if len(input_ids) <= max_length:
+                filtered_samples.append(sample)
+                continue
+            if prompt_truncation == "none":
+                continue
 
-    logger.info(f"Filtered {len(origin_samples) - len(filtered_samples)} samples longer than max_length={max_length}.")
+            truncated_ids = input_ids[-max_length:] if prompt_truncation == "left" else input_ids[:max_length]
+            filtered_samples.append(Sample(**(sample.to_dict() | {
+                "prompt": tokenizer.decode(
+                    truncated_ids,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            })))
+            truncated_count += 1
+
+        if truncated_count > 0:
+            logger.info(
+                "Truncated %s prompts longer than max_length=%s with prompt_truncation=%s.",
+                truncated_count,
+                max_length,
+                prompt_truncation,
+            )
+
+    if prompt_truncation == "none":
+        logger.info(f"Filtered {len(origin_samples) - len(filtered_samples)} samples longer than max_length={max_length}.")
+    else:
+        logger.info(
+            "Processed prompt max_length=%s with prompt_truncation=%s. kept=%s dropped=%s",
+            max_length,
+            prompt_truncation,
+            len(filtered_samples),
+            len(origin_samples) - len(filtered_samples),
+        )
 
     return filtered_samples
 
@@ -181,6 +219,7 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        prompt_truncation="none",
     ):
         origin_samples = []
         for data in read_file(path):
@@ -230,7 +269,13 @@ class Dataset:
             )
 
         if max_length is not None:
-            self.origin_samples = filter_long_prompt(origin_samples, tokenizer, processor, max_length)
+            self.origin_samples = filter_long_prompt(
+                origin_samples,
+                tokenizer,
+                processor,
+                max_length,
+                prompt_truncation=prompt_truncation,
+            )
         else:
             self.origin_samples = origin_samples
 

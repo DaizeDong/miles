@@ -17,6 +17,9 @@ from miles.utils.misc import load_function
 
 logger = logging.getLogger(__name__)
 
+PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES = ("l2", "kl", "kl-post")
+PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES = ("fp32", "bf16", "fp16")
+
 
 def reset_arg(parser, name, **kwargs):
     """
@@ -32,6 +35,63 @@ def reset_arg(parser, name, **kwargs):
             break
     else:
         parser.add_argument(name, **kwargs)
+
+
+def _validate_predictive_routing_replay_args(args):
+    predictive_enabled = bool(getattr(args, "enable_predictive_routing_replay", False))
+    args.enable_bias_predictor = predictive_enabled
+    args.predictive_routing_replay_mode = "R2" if predictive_enabled else None
+
+    if not predictive_enabled:
+        return
+
+    if getattr(args, "train_backend", None) != "megatron":
+        raise AssertionError("predictive routing replay is only supported for the megatron backend.")
+
+    if getattr(args, "use_rollout_routing_replay", False):
+        raise AssertionError(
+            "predictive routing replay phase 1 only supports actor-side R2; do not combine it with "
+            "--use-rollout-routing-replay."
+        )
+
+    if not getattr(args, "use_routing_replay", False):
+        raise AssertionError("--enable-predictive-routing-replay requires --use-routing-replay.")
+
+    if getattr(args, "allgather_cp", False):
+        raise AssertionError(
+            "predictive routing replay phase 1 does not support --allgather-cp because predictive states are "
+            "recorded and replayed in local packed-token order."
+        )
+
+    if args.bias_predictor_loss_type not in PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES:
+        raise AssertionError(
+            f"Unsupported bias predictor loss type: {args.bias_predictor_loss_type}. "
+            f"Expected one of {PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES}."
+        )
+
+    if args.predictive_storage_dtype not in PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES:
+        raise AssertionError(
+            f"Unsupported predictive storage dtype: {args.predictive_storage_dtype}. "
+            f"Expected one of {PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES}."
+        )
+
+    if args.bias_predictor_lr_mult <= 0:
+        raise AssertionError("--bias-predictor-lr-mult must be greater than 0.")
+
+    if args.predictive_downsample_batch_size is not None and args.predictive_downsample_batch_size <= 0:
+        raise AssertionError("--predictive-downsample-batch-size must be greater than 0 when set.")
+
+    if args.predictive_downsample_max_len_limit is not None and args.predictive_downsample_max_len_limit <= 0:
+        raise AssertionError("--predictive-downsample-max-len-limit must be greater than 0 when set.")
+
+
+def _validate_router_logits_args(args):
+    if getattr(args, "router_logits_path", None) == "":
+        args.router_logits_path = None
+    if getattr(args, "router_logits_save_freq", 1) <= 0:
+        raise AssertionError("--router-logits-save-freq must be greater than 0.")
+    if getattr(args, "router_logits_max_tokens", None) is not None and args.router_logits_max_tokens <= 0:
+        raise AssertionError("--router-logits-max-tokens must be greater than 0 when set.")
 
 
 def get_miles_extra_args_provider(add_custom_arguments=None):
@@ -551,6 +611,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
             parser.add_argument(
+                "--prompt-truncation",
+                type=str,
+                choices=("none", "left", "right"),
+                default="none",
+                help=(
+                    "How to handle prompts longer than the configured max prompt length. "
+                    "'none' keeps the existing Miles behavior and filters them out; "
+                    "'left' or 'right' truncates prompt tokens before dataset creation."
+                ),
+            )
+            parser.add_argument(
                 "--chat-template-path",
                 type=str,
                 default=None,
@@ -957,6 +1028,62 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="The rollout routing replay technique from https://arxiv.org/abs/2510.11370",
             )
             parser.add_argument(
+                "--enable-predictive-routing-replay",
+                action="store_true",
+                default=False,
+                help="Enable the phase-1 predictive routing replay pipeline for actor-side R2 training.",
+            )
+            parser.add_argument(
+                "--bias-predictor-loss-type",
+                type=str,
+                default="kl-post",
+                choices=PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES,
+                help="Loss used to train the predictive router bias predictor. Defaults to the paper's main PR2 objective.",
+            )
+            parser.add_argument(
+                "--bias-predictor-lr-mult",
+                type=float,
+                default=1000.0,
+                help="Learning-rate multiplier applied to predictive router bias predictor parameters.",
+            )
+            parser.add_argument(
+                "--predictive-downsample-batch-size",
+                type=int,
+                default=None,
+                help="Optional per-microbatch sequence cap for stored predictive router tensors.",
+            )
+            parser.add_argument(
+                "--predictive-downsample-max-len-limit",
+                type=int,
+                default=None,
+                help="Optional maximum sequence length kept when downsampling predictive router tensors.",
+            )
+            parser.add_argument(
+                "--predictive-storage-dtype",
+                type=str,
+                default="fp32",
+                choices=PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES,
+                help="Storage dtype used for predictive router tensors.",
+            )
+            parser.add_argument(
+                "--router-logits-path",
+                type=str,
+                default=None,
+                help="Directory to save Verl-aligned router logits artifacts. Leave unset to disable.",
+            )
+            parser.add_argument(
+                "--router-logits-save-freq",
+                type=int,
+                default=1,
+                help="Save router logits every N rollout steps when router-logits-path is set.",
+            )
+            parser.add_argument(
+                "--router-logits-max-tokens",
+                type=int,
+                default=None,
+                help="Cap saved router-logit artifacts to the first N tokens per step. Leave unset to save all tokens.",
+            )
+            parser.add_argument(
                 "--use-opsm",
                 action="store_true",
                 default=False,
@@ -1086,8 +1213,8 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 dest="wandb_random_suffix",
                 default=True,
                 help=(
-                    "Whether to add a random suffix to the wandb run name. "
-                    "By default, we will add a random 6 length string with characters to the run name."
+                    "Whether to add a random suffix to the W&B run name while keeping the group stable. "
+                    "Use --wandb-group to control which launches are grouped together."
                 ),
             )
             parser.add_argument(
@@ -1844,6 +1971,9 @@ def miles_validate_args(args):
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
 
+    _validate_router_logits_args(args)
+    _validate_predictive_routing_replay_args(args)
+
     if args.custom_config_path:
         with open(args.custom_config_path) as f:
             data = yaml.safe_load(f) or {}
@@ -1851,6 +1981,8 @@ def miles_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+        _validate_router_logits_args(args)
+        _validate_predictive_routing_replay_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(
