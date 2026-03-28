@@ -1144,10 +1144,12 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
 
     try:
         from megatron.bridge import AutoBridge
+        from transformers import AutoConfig
 
         import miles_plugins.megatron_bridge  # noqa: F401
 
         from miles.utils.megatron_bridge_utils import patch_megatron_model
+        from miles.utils.hf_checkpoint_utils import merge_missing_hf_tensors
 
         path = Path(args.save_hf.format(rollout_id=rollout_id))
 
@@ -1162,6 +1164,16 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
             # For LoRA models, merge_adapter_weights=True (default) merges
             # adapter weights into base weights for a standalone HF model.
             bridge.save_hf_pretrained(model, path=path)
+
+        hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
+        if getattr(hf_config, "model_type", None) == "qwen3_5_moe":
+            merged_keys = merge_missing_hf_tensors(args.hf_checkpoint, path)
+            if should_log and merged_keys:
+                logger.info(
+                    "Restored %s untouched Qwen3.5 passthrough tensors (e.g. visual/MTP) into %s",
+                    len(merged_keys),
+                    path,
+                )
 
         if should_log:
             logger.info(f"Successfully saved merged HuggingFace model to {path}")

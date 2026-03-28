@@ -3,7 +3,6 @@ import json
 import os
 import pickle
 import re
-import shutil
 import time
 
 
@@ -14,6 +13,7 @@ from transformers import AutoConfig
 from typing_extensions import override
 
 from miles.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
+from miles.utils.hf_checkpoint_utils import copy_hf_non_weight_assets, merge_missing_hf_tensors
 
 
 class UnpicklerWrapper(pickle.Unpickler):
@@ -145,19 +145,6 @@ def save_tensors(args, model_name, state_dict, output_dir, chunk_size, vocab_siz
         print(f"{filename} saved in {time.time() - t:.2f} sec.")
 
 
-def copy_assets(origin_hf_dir, output_dir):
-    for filename in os.listdir(origin_hf_dir):
-        if filename == "model.safetensors.index.json" or filename.endswith(".safetensors"):
-            continue
-        origin_filename = os.path.join(origin_hf_dir, filename)
-        if not os.path.isfile(origin_filename):
-            print(f"Skip {filename}, not a file.")
-            continue
-        src, dst = origin_filename, os.path.join(output_dir, filename)
-        print(f"copy from {src} to {dst}")
-        shutil.copy(src, dst)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", type=str, default=None)
@@ -213,4 +200,7 @@ if __name__ == "__main__":
     save_tensors(megatron_args, args.model_name, state_dict, args.output_dir, args.chunk_size, args.vocab_size)
 
     if args.origin_hf_dir:
-        copy_assets(args.origin_hf_dir, args.output_dir)
+        if "qwen3_5" in args.model_name.lower():
+            merged_keys = merge_missing_hf_tensors(args.origin_hf_dir, args.output_dir, chunk_size=args.chunk_size)
+            print(f"merged {len(merged_keys)} missing tensors from {args.origin_hf_dir}")
+        copy_hf_non_weight_assets(args.origin_hf_dir, args.output_dir)
