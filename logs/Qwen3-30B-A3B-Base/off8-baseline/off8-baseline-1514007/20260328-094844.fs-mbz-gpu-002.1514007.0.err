@@ -17706,3 +17706,201 @@
 + ray status --address 10.24.3.213:6379
 + IDLE_ELAPSED=0
 + sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.622463
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1560353
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1565574
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.1093377
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2907537
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2107989
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.870957
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.622463
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1560353
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1565574
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.1093377
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2907537
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2107989
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.870957
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.622463
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1560353
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1565574
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.1093377
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2907537
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2107989
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.870957
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.622463
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1560353
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1565574
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.1093377
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2907537
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2107989
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.870957
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.622463
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1560353
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.1565574
++ IDLE_ELAPSED=0
++ sleep 10
++ grep -qiE 'Running|Pending' /tmp/ray_status.1093377
++ IDLE_ELAPSED=0
++ sleep 10
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ true
++ '[' -f /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off8-baseline/.ray_job_done_1514007 ']'
++ ray status --address 10.24.3.213:6379
++ grep -qiE 'Running|Pending' /tmp/ray_status.2907537
++ IDLE_ELAPSED=0
++ sleep 10
