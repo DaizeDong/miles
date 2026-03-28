@@ -26,9 +26,6 @@ def monkey_patch_torch_dist():
 
     def new_group(*args, **kwargs):
         group = old_new_group(*args, **kwargs)
-        # skip none nccl group.
-        if len(args) >= 3 and args[2] == "gloo" or "backend" in kwargs and kwargs["backend"] == "gloo":
-            return group
 
         # Get ranks from arguments
         if len(args) >= 1 and args[0] is not None:
@@ -39,10 +36,14 @@ def monkey_patch_torch_dist():
             # If no ranks specified, use all ranks in world
             ranks = list(range(dist.get_world_size()))
 
+        backend = kwargs.get("backend")
+        if backend is None and len(args) >= 3:
+            backend = args[2]
+
         if len(ranks) == 1:
             return group
 
-        group = ReloadableProcessGroup(group, ranks)
+        group = ReloadableProcessGroup(group, ranks, backend=backend)
         return group
 
     dist.new_group = new_group
@@ -67,13 +68,16 @@ def monkey_patch_torch_dist():
     dist.all_gather = get_new_function(dist.all_gather)
     dist.all_gather_into_tensor = get_new_function(dist.all_gather_into_tensor)
     dist.all_gather_object = get_new_function(dist.all_gather_object)
+    dist.gather_object = get_new_function(dist.gather_object)
     dist.all_to_all = get_new_function(dist.all_to_all)
     dist.all_to_all_single = get_new_function(dist.all_to_all_single)
     dist.broadcast = get_new_function(dist.broadcast)
+    dist.broadcast_object_list = get_new_function(dist.broadcast_object_list)
     dist.reduce = get_new_function(dist.reduce)
     dist.reduce_scatter = get_new_function(dist.reduce_scatter)
     dist.reduce_scatter_tensor = get_new_function(dist.reduce_scatter_tensor)
     dist.scatter = get_new_function(dist.scatter)
+    dist.scatter_object_list = get_new_function(dist.scatter_object_list)
     dist.gather = get_new_function(dist.gather)
     dist.barrier = get_new_function(dist.barrier)
     dist.send = get_new_function(dist.send)
@@ -111,7 +115,7 @@ def monkey_patch_torch_dist():
 class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     GROUPS = {}
 
-    def __init__(self, group, ranks):
+    def __init__(self, group, ranks, backend=None):
         super().__init__(
             rank=dist.get_rank(group),
             size=dist.get_world_size(group),
@@ -119,6 +123,7 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         self.group = group
         self.group_info = {
             "ranks": ranks,
+            "backend": backend,
         }
         pid = os.getpid()
         if pid not in ReloadableProcessGroup.GROUPS:
@@ -154,7 +159,11 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
         for reloadable_group in reloadable_groups:
             if reloadable_group.group is not None:
                 continue
-            group = old_new_group(ranks=reloadable_group.group_info["ranks"], backend="nccl")
+            backend = reloadable_group.group_info.get("backend")
+            if backend is None:
+                group = old_new_group(ranks=reloadable_group.group_info["ranks"])
+            else:
+                group = old_new_group(ranks=reloadable_group.group_info["ranks"], backend=backend)
             reloadable_group.group = group
 
     def rank(self) -> int:

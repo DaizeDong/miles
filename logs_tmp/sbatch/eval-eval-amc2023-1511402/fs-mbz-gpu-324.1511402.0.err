@@ -1,0 +1,41 @@
+Traceback (most recent call last):
+  File "/usr/local/bin/ray", line 7, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/ray/scripts/scripts.py", line 2754, in main
+    return cli()
+           ^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1442, in __call__
+    return self.main(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1363, in main
+    rv = self.invoke(ctx)
+         ^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1830, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1830, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 1226, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/click/core.py", line 794, in invoke
+    return callback(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/ray/dashboard/modules/job/cli_utils.py", line 54, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/ray/autoscaler/_private/cli_logger.py", line 823, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/ray/dashboard/modules/job/cli.py", line 278, in submit
+    job_id = client.submit_job(
+             ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/ray/dashboard/modules/job/sdk.py", line 253, in submit_job
+    self._raise_error(r)
+  File "/usr/local/lib/python3.12/dist-packages/ray/dashboard/modules/dashboard_sdk.py", line 283, in _raise_error
+    raise RuntimeError(
+RuntimeError: Request failed with status code 500: No available agent to submit job, please try again later..
+srun: error: fs-mbz-gpu-324: task 0: Exited with exit code 1
+srun: Terminating StepId=1511402.0

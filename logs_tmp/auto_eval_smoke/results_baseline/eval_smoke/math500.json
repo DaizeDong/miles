@@ -1,0 +1,32 @@
+{
+  "benchmark": "math500",
+  "steps": [
+    269
+  ],
+  "step_labels": [
+    "smoke_rollout_0269"
+  ],
+  "math500": [
+    0.5
+  ],
+  "metric_key": [
+    "test_score/Maxwell-Jia/AIME_2024"
+  ],
+  "all_test_scores": [
+    {
+      "test_score/Maxwell-Jia/AIME_2024": 0.5
+    }
+  ],
+  "model_path": [
+    "/mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off2-baseline/hf/rollout_0269"
+  ],
+  "generated_path": [
+    "/mnt/weka/home/hongyi.wang/workspace/rlhf/miles/logs_tmp/auto_eval_smoke/results_baseline/eval_smoke/math500/step_smoke_rollout_0269.parquet"
+  ],
+  "eval_log": [
+    "/mnt/weka/home/hongyi.wang/workspace/rlhf/miles/logs_tmp/auto_eval_smoke/results_baseline/eval_smoke/math500/step_smoke_rollout_0269.eval.log"
+  ],
+  "updated_at_utc": [
+    "2026-03-27T08:38:25.269507+00:00"
+  ]
+}

@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "<stdin>", line 9, in <module>
+  File "/usr/lib/python3.12/pathlib.py", line 1027, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off2-r3/eval/math500/step_rollout_0179.eval.log'
+srun: error: fs-mbz-gpu-137: task 0: Exited with exit code 1
+srun: Terminating StepId=1509900.0

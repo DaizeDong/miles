@@ -5,6 +5,7 @@ import torch
 from miles.backends.megatron_utils.predictive_router_replay import (
     PredictiveRouterReplayBuffer,
     PredictiveRouterReplayState,
+    PredictiveTrainStepState,
     RouterPredictiveAction,
     _ensure_bias_predictor_runtime_placement,
     build_synthetic_predictive_loss,
@@ -13,138 +14,14 @@ from miles.backends.megatron_utils.predictive_router_replay import (
     compute_predictive_bias_ratio,
     compute_predictive_loss,
     disable_predictive_param_groups,
+    get_predictive_replay_controller,
     restore_predictive_param_groups,
 )
 from miles.backends.megatron_utils.predictive_router_utils import (
+    RecordedPredictiveMicrobatch,
     build_local_predictive_sample_lengths,
-    build_predictive_valid_mask,
     pack_recorded_predictive_microbatch,
-    prepare_predictive_router_data,
-    restore_predictive_samples,
-    select_predictive_samples,
 )
-
-
-def test_build_predictive_valid_mask_prefix_lengths():
-    attention_mask = torch.tensor(
-        [
-            [0, 1, 1, 1],
-            [1, 1, 1, 1],
-        ],
-        dtype=torch.bool,
-    )
-
-    valid_mask, selected_lens = build_predictive_valid_mask(
-        attention_mask=attention_mask,
-        valid_indices=[0, 1],
-        old_lengths=[2, 3],
-        old_token_positions_list=None,
-    )
-
-    assert selected_lens == [2, 3]
-    assert valid_mask.tolist() == [True, True, False, True, True, True, False]
-
-
-def test_build_predictive_valid_mask_uses_explicit_positions():
-    attention_mask = torch.tensor(
-        [
-            [0, 1, 1, 1, 1],
-            [1, 1, 1, 1, 0],
-        ],
-        dtype=torch.bool,
-    )
-    old_token_positions = [
-        torch.tensor([0, 2], dtype=torch.int32),
-        torch.tensor([1, 2], dtype=torch.int32),
-    ]
-
-    valid_mask, selected_lens = build_predictive_valid_mask(
-        attention_mask=attention_mask,
-        valid_indices=[0, 1],
-        old_lengths=[2, 2],
-        old_token_positions_list=old_token_positions,
-    )
-
-    assert selected_lens == [2, 2]
-    assert valid_mask.tolist() == [True, False, True, False, False, True, True, False]
-
-
-def test_select_predictive_samples_downsamples_and_restores():
-    generator = torch.Generator().manual_seed(1234)
-    old_inputs_list = [
-        torch.randn(4, 2, 3),
-        torch.randn(2, 2, 3),
-        torch.randn(3, 2, 3),
-    ]
-    old_logits_list = [
-        torch.randn(4, 2, 5),
-        torch.randn(2, 2, 5),
-        torch.randn(3, 2, 5),
-    ]
-
-    selection = select_predictive_samples(
-        old_inputs_list=old_inputs_list,
-        old_logits_list=old_logits_list,
-        downsample_batch_size=2,
-        max_len_limit=3,
-        storage_dtype="fp16",
-        generator=generator,
-    )
-
-    assert selection.sampled_indices == [1, 2]
-    assert selection.sampled_mask.tolist() == [False, True, True]
-    assert all(tensor.dtype == torch.float16 for tensor in selection.old_inputs)
-    assert all(tensor.dtype == torch.float16 for tensor in selection.old_logits)
-
-    restored_inputs = restore_predictive_samples(selection.old_inputs, selection.sampled_mask)
-    restored_logits = restore_predictive_samples(selection.old_logits, selection.sampled_mask)
-    assert restored_inputs[0] is None
-    assert restored_logits[0] is None
-    assert restored_inputs[1].shape == torch.Size([2, 2, 3])
-    assert restored_logits[2].shape == torch.Size([3, 2, 5])
-
-
-def test_select_predictive_samples_falls_back_to_shortest_sequences():
-    old_inputs_list = [
-        torch.randn(6, 2, 3),
-        torch.randn(5, 2, 3),
-        torch.randn(2, 2, 3),
-    ]
-    old_logits_list = [
-        torch.randn(6, 2, 5),
-        torch.randn(5, 2, 5),
-        torch.randn(2, 2, 5),
-    ]
-
-    selection = select_predictive_samples(
-        old_inputs_list=old_inputs_list,
-        old_logits_list=old_logits_list,
-        downsample_batch_size=2,
-        max_len_limit=3,
-    )
-
-    assert selection.sampled_indices == [1, 2]
-    assert selection.sampled_mask.tolist() == [False, True, True]
-
-
-def test_select_predictive_samples_skips_zero_length_entries():
-    old_inputs_list = [
-        torch.randn(0, 2, 3),
-        torch.randn(2, 2, 3),
-    ]
-    old_logits_list = [
-        torch.randn(0, 2, 5),
-        torch.randn(2, 2, 5),
-    ]
-
-    selection = select_predictive_samples(
-        old_inputs_list=old_inputs_list,
-        old_logits_list=old_logits_list,
-        downsample_batch_size=1,
-    )
-
-    assert selection.sampled_indices == [1]
-    assert selection.sampled_mask.tolist() == [False, True]
 
 
 def test_pack_recorded_predictive_microbatch_builds_mask_and_storage():
@@ -176,6 +53,7 @@ def test_pack_recorded_predictive_microbatch_builds_mask_and_storage():
     assert packed.old_logits_concat.dtype == torch.float16
     assert packed.old_inputs_concat.shape == torch.Size([2, 2, 3])
     assert packed.old_logits_concat.shape == torch.Size([2, 2, 4])
+    assert packed.predictive_loss_scale == 2.0 / 6.0
 
 
 def test_build_local_predictive_sample_lengths_uses_arithmetic_layout():
@@ -195,72 +73,6 @@ def test_build_local_predictive_sample_lengths_uses_arithmetic_layout():
     ) == [4, 4]
 
 
-def test_prepare_predictive_router_data_trims_to_current_lengths():
-    attention_mask = torch.tensor(
-        [
-            [1, 1, 0],
-            [1, 1, 1],
-        ],
-        dtype=torch.bool,
-    )
-    old_inputs_list = [
-        torch.arange(24, dtype=torch.float32).reshape(4, 2, 3),
-        torch.arange(12, dtype=torch.float32).reshape(2, 2, 3),
-    ]
-    old_logits_list = [
-        torch.arange(40, dtype=torch.float32).reshape(4, 2, 5),
-        torch.arange(20, dtype=torch.float32).reshape(2, 2, 5),
-    ]
-
-    prepared = prepare_predictive_router_data(
-        old_inputs_list=old_inputs_list,
-        old_logits_list=old_logits_list,
-        attention_mask=attention_mask,
-    )
-
-    assert prepared.has_valid_samples is True
-    assert prepared.valid_indices == [0, 1]
-    assert prepared.selected_current_lens == [2, 2]
-    assert prepared.valid_mask.tolist() == [True, True, True, True, False]
-    assert prepared.old_inputs_concat.shape == torch.Size([4, 2, 3])
-    assert prepared.old_logits_concat.shape == torch.Size([4, 2, 5])
-    assert torch.equal(prepared.old_inputs_concat[:2], old_inputs_list[0][:2])
-    assert torch.equal(prepared.old_inputs_concat[2:], old_inputs_list[1])
-
-
-def test_prepare_predictive_router_data_uses_explicit_positions():
-    attention_mask = torch.tensor(
-        [
-            [1, 1, 1, 1],
-            [1, 1, 0, 0],
-        ],
-        dtype=torch.bool,
-    )
-    old_inputs_list = [
-        torch.randn(2, 2, 3),
-        torch.randn(2, 2, 3),
-    ]
-    old_logits_list = [
-        torch.randn(2, 2, 5),
-        torch.randn(2, 2, 5),
-    ]
-    old_token_positions_list = [
-        torch.tensor([0, 2], dtype=torch.long),
-        torch.tensor([0, 1], dtype=torch.long),
-    ]
-
-    prepared = prepare_predictive_router_data(
-        old_inputs_list=old_inputs_list,
-        old_logits_list=old_logits_list,
-        attention_mask=attention_mask,
-        old_token_positions_list=old_token_positions_list,
-    )
-
-    assert prepared.valid_indices == [0, 1]
-    assert prepared.selected_current_lens == [2, 2]
-    assert prepared.valid_mask.tolist() == [True, False, True, False, True, True]
-
-
 def test_predictive_router_replay_registry_and_metrics():
     PredictiveRouterReplayState.reset_registry()
     state0 = PredictiveRouterReplayState()
@@ -277,16 +89,19 @@ def test_predictive_router_replay_registry_and_metrics():
         old_inputs_concat=old_inputs_concat,
         old_logits_concat=old_logits_concat,
         valid_mask=valid_mask,
+        loss_scale=0.25,
     )
 
-    state0_inputs, state0_logits, state0_mask = state0.get_predictive_data()
-    state1_inputs, state1_logits, state1_mask = state1.get_predictive_data()
+    state0_inputs, state0_logits, state0_mask, state0_loss_scale = state0.get_predictive_data()
+    state1_inputs, state1_logits, state1_mask, state1_loss_scale = state1.get_predictive_data()
     assert state0_inputs.shape == torch.Size([5, 1, 3])
     assert state0_logits.shape == torch.Size([5, 1, 4])
     assert state1_inputs.shape == torch.Size([5, 1, 3])
     assert state1_logits.shape == torch.Size([5, 1, 4])
     assert torch.equal(state0_mask, valid_mask)
     assert torch.equal(state1_mask, valid_mask)
+    assert state0_loss_scale == 0.25
+    assert state1_loss_scale == 0.25
 
     PredictiveRouterReplayState.record_predictive_loss(0, 1.0)
     PredictiveRouterReplayState.record_predictive_loss(1, 3.0)
@@ -301,11 +116,77 @@ def test_predictive_router_replay_registry_and_metrics():
     assert PredictiveRouterReplayState.get_and_clear_predictive_metrics() == {}
 
     PredictiveRouterReplayState.clear_global_predictive_data()
-    assert state0.get_predictive_data() == (None, None, None)
-    assert state1.get_predictive_data() == (None, None, None)
+    assert state0.get_predictive_data() == (None, None, None, 1.0)
+    assert state1.get_predictive_data() == (None, None, None, 1.0)
     PredictiveRouterReplayState.clear_global_predictive_action()
     assert state0.predictive_action == RouterPredictiveAction.DISABLED
     assert state1.predictive_action == RouterPredictiveAction.DISABLED
+
+
+def test_predictive_controller_applies_compute_and_skip_modes():
+    controller = get_predictive_replay_controller()
+    controller.reset_registry()
+    state0 = PredictiveRouterReplayState()
+    state1 = PredictiveRouterReplayState()
+
+    skipped_microbatch = RecordedPredictiveMicrobatch(
+        old_inputs_concat=torch.full((2, 2, 4), 1.0),
+        old_logits_concat=torch.full((2, 2, 5), 2.0),
+        valid_mask=torch.tensor([True, True], dtype=torch.bool),
+        sampled_indices=[0],
+        sample_lengths=[2],
+        total_token_count=2,
+        predictive_loss_scale=1.0,
+    )
+    valid_microbatch = RecordedPredictiveMicrobatch(
+        old_inputs_concat=torch.full((3, 2, 4), 7.0),
+        old_logits_concat=torch.full((3, 2, 5), 9.0),
+        valid_mask=torch.tensor([True, False, True], dtype=torch.bool),
+        sampled_indices=[1],
+        sample_lengths=[3],
+        total_token_count=3,
+        predictive_loss_scale=0.5,
+    )
+    empty_microbatch = RecordedPredictiveMicrobatch(
+        old_inputs_concat=None,
+        old_logits_concat=None,
+        valid_mask=torch.zeros(0, dtype=torch.bool),
+        sampled_indices=[],
+        sample_lengths=[],
+        total_token_count=0,
+        predictive_loss_scale=1.0,
+    )
+
+    controller.clear_microbatch_buffer()
+    controller.append_microbatch(skipped_microbatch)
+    controller.append_microbatch(valid_microbatch)
+    controller.apply_predictive_train_mode("skip", consume_microbatch=True)
+    assert controller.get_global_predictive_action() == RouterPredictiveAction.SKIP_PREDICTIVE
+    assert controller.used_valid_predictive_data is False
+    assert controller.remaining_microbatch_count() == 1
+    assert state0.get_predictive_data() == (None, None, None, 1.0)
+
+    controller.apply_predictive_train_mode("compute")
+    assert controller.get_global_predictive_action() == RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS
+    assert controller.used_valid_predictive_data is True
+    assert PredictiveTrainStepState.used_valid_predictive_data is True
+    assert state0.get_predictive_data()[0].shape == torch.Size([3, 1, 4])
+    assert state1.get_predictive_data()[1].shape == torch.Size([3, 1, 5])
+    assert torch.all(state0.get_predictive_data()[0] == 7.0)
+    assert torch.all(state1.get_predictive_data()[1] == 9.0)
+    assert state0.get_predictive_data()[3] == 0.5
+    assert state1.get_predictive_data()[3] == 0.5
+
+    controller.reset_train_step_usage()
+    controller.clear_global_predictive_data()
+    controller.clear_global_predictive_action()
+    controller.clear_microbatch_buffer()
+    controller.append_microbatch(empty_microbatch)
+    controller.apply_predictive_train_mode("compute")
+    assert controller.get_global_predictive_action() == RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS
+    assert controller.used_valid_predictive_data is True
+    assert PredictiveTrainStepState.used_valid_predictive_data is True
+    assert state0.get_predictive_data() == (None, None, None, 1.0)
 
 
 def test_predictive_router_replay_buffer_cursor():
