@@ -59,6 +59,21 @@ def get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
 ):
+    def maybe_initialize_predictive_router_modules(model: GPTModel) -> GPTModel:
+        if role != "actor" or not getattr(args, "enable_predictive_routing_replay", False):
+            return model
+        from .predictive_router_replay import initialize_predictive_router_modules
+
+        # Predictive router parameters must exist before Megatron wraps the model with DDP
+        # and constructs distributed-optimizer grad buffers.
+        initialize_predictive_router_modules(
+            model_chunks=model,
+            enabled=True,
+            loss_type=getattr(args, "bias_predictor_loss_type", "kl-post"),
+            lr_mult=getattr(args, "bias_predictor_lr_mult", 1.0),
+        )
+        return model
+
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):
 
@@ -77,6 +92,7 @@ def get_model_provider_func(
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
             else:
                 model = custom_model_provider(pre_process=pre_process, post_process=post_process)
+            model = maybe_initialize_predictive_router_modules(model)
             # Apply critic output layer if needed
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
@@ -125,7 +141,8 @@ def get_model_provider_func(
             # caller's pg_collection here, those code paths hit AttributeError.
             if pg_collection is not None:
                 provider._pg_collection = pg_collection
-            return provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+            return maybe_initialize_predictive_router_modules(model)
 
         return wrapped_bridge_provider
 
@@ -252,6 +269,7 @@ def get_model_provider_func(
         with build_model_context(**build_model_context_args):
             model = GPTModel(**kwargs)
 
+        model = maybe_initialize_predictive_router_modules(model)
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 

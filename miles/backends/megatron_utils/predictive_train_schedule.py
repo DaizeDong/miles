@@ -1,11 +1,15 @@
 def get_predictive_actor_train_pass_count(*, role: str, predictive_enabled: bool) -> int:
-    if role == "actor" and predictive_enabled:
-        return 2
     return 1
 
 
 def get_effective_train_iters(*, base_train_iters: int, role: str, predictive_enabled: bool) -> int:
-    return base_train_iters * get_predictive_actor_train_pass_count(role=role, predictive_enabled=predictive_enabled)
+    return base_train_iters
+
+
+def get_predictive_train_mode_for_step(*, role: str, predictive_enabled: bool, step_id: int) -> str:
+    if role == "actor" and predictive_enabled and step_id == 0:
+        return "skip"
+    return "compute"
 
 
 def get_rollout_train_step_id(

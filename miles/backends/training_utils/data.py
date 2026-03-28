@@ -131,8 +131,30 @@ def get_batch(
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
     tokens = batch["tokens"]
+    global_token_ids = batch.get("global_token_ids")
+    if "global_token_ids" in keys and global_token_ids is None:
+        sample_indices = batch.get("sample_indices")
+        if sample_indices is None:
+            sample_indices = list(range(len(tokens)))
+        num_local_samples = len(data_iterator.rollout_data["total_lengths"])
+        dp_sample_offset = parallel_state.dp_rank * num_local_samples
+        rollout_max_seq_lens = data_iterator.rollout_data.get("max_seq_lens")
+        if qkv_format == "bshd" and rollout_max_seq_lens is not None:
+            seq_stride = rollout_max_seq_lens[0]
+        else:
+            seq_stride = max(data_iterator.rollout_data["total_lengths"])
+        global_token_ids = [
+            torch.arange(
+                (dp_sample_offset + sample_idx) * seq_stride,
+                (dp_sample_offset + sample_idx) * seq_stride + t.size(0),
+                device=t.device,
+                dtype=torch.long,
+            )
+            for sample_idx, t in zip(sample_indices, tokens, strict=True)
+        ]
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
+    global_token_pad_id = -1
     pad_size = parallel_state.tp.size * pad_multiplier
 
     # for cp, we need all tokens to calculate logprob
@@ -145,6 +167,12 @@ def get_batch(
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
+        if global_token_ids is not None:
+            global_token_ids = [
+                slice_with_cp(t, global_token_pad_id, parallel_state, qkv_format, max_seqlen)
+                for t in global_token_ids
+            ]
+            global_token_ids = torch.stack(global_token_ids)
 
     elif qkv_format == "thd":
         cp_rank = parallel_state.cp.rank
@@ -157,6 +185,8 @@ def get_batch(
                 cu_seqlens_list.append(cu_seqlens_list[-1] + t.size(0))
 
             tokens = torch.cat(tokens, dim=0)
+            if global_token_ids is not None:
+                global_token_ids = torch.cat(global_token_ids, dim=0)
 
             # Pad global stream so (1) divisible by cp_size (equal chunks),
             # (2) divisible by pad_size (reduce fragmentation).
@@ -164,23 +194,33 @@ def get_batch(
             pad = (global_pad_size - tokens.size(0) % global_pad_size) % global_pad_size
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
+                if global_token_ids is not None:
+                    global_token_ids = F.pad(global_token_ids, (0, pad), value=global_token_pad_id)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
             cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=torch.cuda.current_device())
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
+            if global_token_ids is not None:
+                global_token_ids = global_token_ids.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
+            if global_token_ids is not None:
+                global_token_ids = [slice_with_cp(t, global_token_pad_id, qkv_format) for t in global_token_ids]
 
             cu_seqlens = [0]
             for t in tokens:
                 cu_seqlens.append(cu_seqlens[-1] + t.size(0))
 
             tokens = torch.cat(tokens)
+            if global_token_ids is not None:
+                global_token_ids = torch.cat(global_token_ids)
 
             # Always pad to reduce memory fragmentation and maybe make the computation faster
             pad = (pad_size - tokens.size(0) % pad_size) % pad_size
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
+                if global_token_ids is not None:
+                    global_token_ids = F.pad(global_token_ids, (0, pad), value=global_token_pad_id)
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
@@ -189,6 +229,8 @@ def get_batch(
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
         tokens = tokens.unsqueeze(0)
+        if global_token_ids is not None:
+            global_token_ids = global_token_ids.unsqueeze(0)
 
         batch["cu_seqlens"] = cu_seqlens
         batch["max_seqlen"] = max_seqlen
@@ -196,6 +238,8 @@ def get_batch(
         raise ValueError(f"Unsupported qkv_format: {qkv_format}")
 
     batch["tokens"] = tokens
+    if global_token_ids is not None:
+        batch["global_token_ids"] = global_token_ids
 
     if get_position_ids:
         assert not allgather_cp, "allgather CP is not supported for FSDP"
@@ -308,18 +352,26 @@ class DataIterator:
         """
         batch = {}
         for key in keys:
+            if self.micro_batch_indices is not None:
+                indices = self.micro_batch_indices[self.offset]
+            else:
+                assert self.offset + self.micro_batch_size <= len(
+                    self.rollout_data["total_lengths"]
+                ), (
+                    f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, "
+                    f"len(total_lengths): {len(self.rollout_data['total_lengths'])}"
+                )
+                indices = list(range(self.offset, self.offset + self.micro_batch_size))
+
+            if key == "sample_indices":
+                batch[key] = indices
+                continue
+
             vals = self.rollout_data.get(key, None)
             if vals is None:
                 batch[key] = None
             else:
-                if self.micro_batch_indices is not None:
-                    indices = self.micro_batch_indices[self.offset]
-                    batch[key] = [vals[i] for i in indices]
-                else:
-                    assert self.offset + self.micro_batch_size <= len(
-                        vals
-                    ), f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, len(vals): {len(vals)}"
-                    batch[key] = vals[self.offset : self.offset + self.micro_batch_size]
+                batch[key] = [vals[i] for i in indices]
 
         if self.micro_batch_indices is not None:
             self.offset += 1

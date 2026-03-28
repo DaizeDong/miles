@@ -1,0 +1,134 @@
+W0328 06:17:33.141000 1558882 torch/distributed/run.py:803] 
+W0328 06:17:33.141000 1558882 torch/distributed/run.py:803] *****************************************
+W0328 06:17:33.141000 1558882 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0328 06:17:33.141000 1558882 torch/distributed/run.py:803] *****************************************
+[2026-03-28 06:17:50] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:17:50] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:17:50] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+[2026-03-28 06:17:50] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:17:50] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:17:50] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:17:50] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:17:50] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+Traceback (most recent call last):
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 118, in <module>
+Traceback (most recent call last):
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 118, in <module>
+    main()
+      File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 78, in main
+main()
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 78, in main
+    export_path = Path(args.save_hf.format(rollout_id=rollout_id)).resolve()
+    export_path = Path(args.save_hf.format(rollout_id=rollout_id)).resolve()
+                                           ^ ^ ^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^ValueError^: 
+Single '}' encountered in format string
+ValueError: Single '}' encountered in format string
+[2026-03-28 06:17:50] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:17:50] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+Traceback (most recent call last):
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 118, in <module>
+    main()
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 78, in main
+    export_path = Path(args.save_hf.format(rollout_id=rollout_id)).resolve()
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: Single '}' encountered in format string
+Traceback (most recent call last):
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 118, in <module>
+    main()
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 78, in main
+    export_path = Path(args.save_hf.format(rollout_id=rollout_id)).resolve()
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: Single '}' encountered in format string
+[2026-03-28 06:17:50] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:17:50] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+[2026-03-28 06:17:50] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:17:50] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+Traceback (most recent call last):
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 118, in <module>
+    main()
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 78, in main
+    export_path = Path(args.save_hf.format(rollout_id=rollout_id)).resolve()
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: Single '}' encountered in format string
+Traceback (most recent call last):
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 118, in <module>
+Traceback (most recent call last):
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 118, in <module>
+    main()
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 78, in main
+    main()
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 78, in main
+    export_path = Path(args.save_hf.format(rollout_id=rollout_id)).resolve()
+    export_path = Path(args.save_hf.format(rollout_id=rollout_id)).resolve() 
+                                        ^ ^ ^ ^ ^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^ValueError^: ^Single '}' encountered in format string^
+
+ValueError: Single '}' encountered in format string
+[2026-03-28 06:17:50] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:17:50] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+Traceback (most recent call last):
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 118, in <module>
+    main()
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 78, in main
+    export_path = Path(args.save_hf.format(rollout_id=rollout_id)).resolve()
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: Single '}' encountered in format string
+W0328 06:17:52.185000 1558882 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 1559487 closing signal SIGTERM
+W0328 06:17:52.186000 1558882 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 1559488 closing signal SIGTERM
+W0328 06:17:52.186000 1558882 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 1559489 closing signal SIGTERM
+W0328 06:17:52.186000 1558882 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 1559490 closing signal SIGTERM
+W0328 06:17:52.187000 1558882 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 1559491 closing signal SIGTERM
+W0328 06:17:52.187000 1558882 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 1559492 closing signal SIGTERM
+W0328 06:17:52.187000 1558882 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 1559494 closing signal SIGTERM
+E0328 06:17:52.465000 1558882 torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 6 (pid: 1559493) of binary: /usr/bin/python3
+Traceback (most recent call last):
+  File "/usr/local/bin/torchrun", line 7, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.12/dist-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py FAILED
+------------------------------------------------------------
+Failures:
+  <NO_OTHER_FAILURES>
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-03-28_06:17:52
+  host      : fs-mbz-gpu-903
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 1559493)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
+srun: error: fs-mbz-gpu-903: task 0: Exited with exit code 1
+srun: Terminating StepId=1513393.0

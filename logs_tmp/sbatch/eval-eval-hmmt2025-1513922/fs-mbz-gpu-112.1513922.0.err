@@ -1,0 +1,2 @@
+srun: error: fs-mbz-gpu-112: task 0: Exited with exit code 1
+srun: Terminating StepId=1513922.0

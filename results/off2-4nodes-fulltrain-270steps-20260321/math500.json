@@ -1,0 +1,29 @@
+{
+  "entries": [
+    {
+      "step_label": "rollout_0269",
+      "score": 0.488,
+      "metric_key": "test_score/Maxwell-Jia/AIME_2024",
+      "all_test_scores": {
+        "test_score/Maxwell-Jia/AIME_2024": 0.488
+      },
+      "model_path": "/mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/PREEXP-Qwen3-30B-A3B-Base-off2-4nodes-fulltrain-270steps-20260321/hf/rollout_0269",
+      "generated_path": "/mnt/weka/home/hongyi.wang/workspace/rlhf/miles/results/off2-4nodes-fulltrain-270steps-20260321/math500/step_rollout_0269.parquet",
+      "eval_log": "/mnt/weka/home/hongyi.wang/workspace/rlhf/miles/results/off2-4nodes-fulltrain-270steps-20260321/math500/step_rollout_0269.eval.log",
+      "updated_at_utc": "2026-03-22T00:01:42.598653+00:00"
+    }
+  ],
+  "benchmark": "math500",
+  "latest": {
+    "step_label": "rollout_0269",
+    "score": 0.488,
+    "metric_key": "test_score/Maxwell-Jia/AIME_2024",
+    "all_test_scores": {
+      "test_score/Maxwell-Jia/AIME_2024": 0.488
+    },
+    "model_path": "/mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/PREEXP-Qwen3-30B-A3B-Base-off2-4nodes-fulltrain-270steps-20260321/hf/rollout_0269",
+    "generated_path": "/mnt/weka/home/hongyi.wang/workspace/rlhf/miles/results/off2-4nodes-fulltrain-270steps-20260321/math500/step_rollout_0269.parquet",
+    "eval_log": "/mnt/weka/home/hongyi.wang/workspace/rlhf/miles/results/off2-4nodes-fulltrain-270steps-20260321/math500/step_rollout_0269.eval.log",
+    "updated_at_utc": "2026-03-22T00:01:42.598653+00:00"
+  }
+}

@@ -86,6 +86,15 @@ def _validate_predictive_routing_replay_args(args):
         raise AssertionError("--predictive-downsample-max-len-limit must be greater than 0 when set.")
 
 
+def _validate_router_logits_args(args):
+    if getattr(args, "router_logits_path", None) == "":
+        args.router_logits_path = None
+    if getattr(args, "router_logits_save_freq", 1) <= 0:
+        raise AssertionError("--router-logits-save-freq must be greater than 0.")
+    if getattr(args, "router_logits_max_tokens", None) is not None and args.router_logits_max_tokens <= 0:
+        raise AssertionError("--router-logits-max-tokens must be greater than 0 when set.")
+
+
 def get_miles_extra_args_provider(add_custom_arguments=None):
     def add_miles_arguments(parser):
         # Ray
@@ -1142,9 +1151,27 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--predictive-storage-dtype",
                 type=str,
-                default="bf16",
+                default="fp32",
                 choices=PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES,
                 help="Storage dtype used for predictive router tensors.",
+            )
+            parser.add_argument(
+                "--router-logits-path",
+                type=str,
+                default=None,
+                help="Directory to save Verl-aligned router logits artifacts. Leave unset to disable.",
+            )
+            parser.add_argument(
+                "--router-logits-save-freq",
+                type=int,
+                default=1,
+                help="Save router logits every N rollout steps when router-logits-path is set.",
+            )
+            parser.add_argument(
+                "--router-logits-max-tokens",
+                type=int,
+                default=None,
+                help="Cap saved router-logit artifacts to the first N tokens per step. Leave unset to save all tokens.",
             )
             parser.add_argument(
                 "--use-opsm",
@@ -2271,6 +2298,7 @@ def miles_validate_args(args):
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True
 
+    _validate_router_logits_args(args)
     _validate_predictive_routing_replay_args(args)
 
     if args.custom_config_path:
@@ -2280,6 +2308,7 @@ def miles_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+        _validate_router_logits_args(args)
         _validate_predictive_routing_replay_args(args)
 
     if args.eval_max_context_len is None:

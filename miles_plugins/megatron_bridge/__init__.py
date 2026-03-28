@@ -67,3 +67,5 @@ try:
     from . import nemotron_h  # noqa: F401
 except Exception as _e:  # pragma: no cover - defensive
     logger.warning("miles nemotron_h plugin failed to load: %s", _e)
+
+import miles_plugins.mbridge  # noqa: F401

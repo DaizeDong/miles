@@ -122,6 +122,7 @@ arguments = importlib.import_module("miles.utils.arguments")
 PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES = arguments.PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES
 PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES = arguments.PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES
 _validate_predictive_routing_replay_args = arguments._validate_predictive_routing_replay_args
+_validate_router_logits_args = arguments._validate_router_logits_args
 get_miles_extra_args_provider = arguments.get_miles_extra_args_provider
 
 
@@ -174,6 +175,23 @@ def test_predictive_flags_parse():
     assert args.predictive_downsample_batch_size == 4
     assert args.predictive_downsample_max_len_limit == 1024
     assert args.predictive_storage_dtype == "fp16"
+
+
+def test_router_logits_flags_parse():
+    parser = _make_parser()
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "64",
+            "--router-logits-path",
+            "/tmp/router_logits",
+            "--router-logits-save-freq",
+            "10",
+        ]
+    )
+
+    assert args.router_logits_path == "/tmp/router_logits"
+    assert args.router_logits_save_freq == 10
 
 
 def test_predictive_loss_type_defaults_to_kl_post():
@@ -295,3 +313,18 @@ def test_predictive_validation_rejects_nonpositive_downsample_values(field_name,
 
     with pytest.raises(AssertionError, match=message):
         _validate_predictive_routing_replay_args(args)
+
+
+def test_router_logits_validation_normalizes_empty_path():
+    args = Namespace(router_logits_path="", router_logits_save_freq=1)
+
+    _validate_router_logits_args(args)
+
+    assert args.router_logits_path is None
+
+
+def test_router_logits_validation_rejects_nonpositive_save_frequency():
+    args = Namespace(router_logits_path="/tmp/router_logits", router_logits_save_freq=0)
+
+    with pytest.raises(AssertionError, match="router-logits-save-freq"):
+        _validate_router_logits_args(args)

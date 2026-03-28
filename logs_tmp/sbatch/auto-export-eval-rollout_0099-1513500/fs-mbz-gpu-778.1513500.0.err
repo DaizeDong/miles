@@ -1,0 +1,198 @@
+W0328 06:26:09.557000 3486932 torch/distributed/run.py:803] 
+W0328 06:26:09.557000 3486932 torch/distributed/run.py:803] *****************************************
+W0328 06:26:09.557000 3486932 torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0328 06:26:09.557000 3486932 torch/distributed/run.py:803] *****************************************
+[2026-03-28 06:26:26] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:26:26] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:26:26] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:26:26] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:26:26] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:26:26] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:26:26] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:26:26] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:26:26] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:26:26] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:26:26] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:26:26] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:26:26] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:26:26] arguments.py:32 - --tokenizer-model not set, use --hf-checkpoint as tokenizer model.
+[2026-03-28 06:26:26] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+[2026-03-28 06:26:26] arguments.py:1988 - args.eval_max_context_len is not set. Use args.rollout_max_context_len None as default value.
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+/root/Megatron-LM/megatron/training/utils.py:409: UserWarning: Disabling sequence parallelism because tensor model parallelism is disabled
+  warnings.warn(message)
+[2026-03-28 06:26:27] initialize.py:70 - > setting random seeds to 1234 ...
+[2026-03-28 06:26:27] megatron_tokenizer.py:27 - You’re using the legacy tokenizer system, which is deprecated and will be removed in a future release. Please migrate to the new tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).
+[2026-03-28 06:26:27] megatron_tokenizer.py:27 - You’re using the legacy tokenizer system, which is deprecated and will be removed in a future release. Please migrate to the new tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).
+[2026-03-28 06:26:27] megatron_tokenizer.py:27 - You’re using the legacy tokenizer system, which is deprecated and will be removed in a future release. Please migrate to the new tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).
+[2026-03-28 06:26:27] megatron_tokenizer.py:27 - You’re using the legacy tokenizer system, which is deprecated and will be removed in a future release. Please migrate to the new tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).
+[2026-03-28 06:26:27] megatron_tokenizer.py:27 - You’re using the legacy tokenizer system, which is deprecated and will be removed in a future release. Please migrate to the new tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).
+[2026-03-28 06:26:27] megatron_tokenizer.py:27 - You’re using the legacy tokenizer system, which is deprecated and will be removed in a future release. Please migrate to the new tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).
+[2026-03-28 06:26:27] megatron_tokenizer.py:27 - You’re using the legacy tokenizer system, which is deprecated and will be removed in a future release. Please migrate to the new tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).
+[2026-03-28 06:26:27] megatron_tokenizer.py:27 - You’re using the legacy tokenizer system, which is deprecated and will be removed in a future release. Please migrate to the new tokenizer system (`megatron.core.tokenizers.MegatronTokenizer`).
+[2026-03-28 06:26:27] replay_base.py:407 - Applied Miles runtime routing replay patch to TopKRouter.routing
+[2026-03-28 06:26:27] replay_base.py:407 - Applied Miles runtime routing replay patch to TopKRouter.routing
+[2026-03-28 06:26:27] replay_base.py:407 - Applied Miles runtime routing replay patch to TopKRouter.routing
+[2026-03-28 06:26:27] replay_base.py:407 - Applied Miles runtime routing replay patch to TopKRouter.routing
+[2026-03-28 06:26:27] replay_base.py:407 - Applied Miles runtime routing replay patch to TopKRouter.routing
+[2026-03-28 06:26:27] replay_base.py:407 - Applied Miles runtime routing replay patch to TopKRouter.routing
+[2026-03-28 06:26:27] replay_base.py:407 - Applied Miles runtime routing replay patch to TopKRouter.routing
+[2026-03-28 06:26:27] replay_base.py:407 - Applied Miles runtime routing replay patch to TopKRouter.routing
+[2026-03-28 06:26:28] model.py:239 - Registered routing replay state on 48 TopKRouter modules
+[2026-03-28 06:26:28] model.py:239 - Registered routing replay state on 48 TopKRouter modules
+[2026-03-28 06:26:28] model.py:239 - Registered routing replay state on 48 TopKRouter modules
+[2026-03-28 06:26:28] model.py:239 - Registered routing replay state on 48 TopKRouter modules
+[2026-03-28 06:26:28] model.py:239 - Registered routing replay state on 48 TopKRouter modules
+[2026-03-28 06:26:28] model.py:239 - Registered routing replay state on 48 TopKRouter modules
+[2026-03-28 06:26:28] model.py:239 - Registered routing replay state on 48 TopKRouter modules
+[2026-03-28 06:26:28] model.py:239 - Registered routing replay state on 48 TopKRouter modules
+[2026-03-28 06:26:31] utils.py:903 - make_tp_sharded_tensor_for_checkpoint received extra kwargs: ['allow_shape_mismatch']
+[2026-03-28 06:26:31] utils.py:903 - make_tp_sharded_tensor_for_checkpoint received extra kwargs: ['allow_shape_mismatch']
+[2026-03-28 06:26:31] utils.py:903 - make_tp_sharded_tensor_for_checkpoint received extra kwargs: ['allow_shape_mismatch']
+[2026-03-28 06:26:31] utils.py:903 - make_tp_sharded_tensor_for_checkpoint received extra kwargs: ['allow_shape_mismatch']
+[2026-03-28 06:26:31] utils.py:903 - make_tp_sharded_tensor_for_checkpoint received extra kwargs: ['allow_shape_mismatch']
+[2026-03-28 06:26:31] utils.py:903 - make_tp_sharded_tensor_for_checkpoint received extra kwargs: ['allow_shape_mismatch']
+[2026-03-28 06:26:31] utils.py:903 - make_tp_sharded_tensor_for_checkpoint received extra kwargs: ['allow_shape_mismatch']
+[2026-03-28 06:26:31] utils.py:903 - make_tp_sharded_tensor_for_checkpoint received extra kwargs: ['allow_shape_mismatch']
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:958: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:958: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:958: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:958: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:958: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:958: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:958: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/root/Megatron-LM/megatron/core/dist_checkpointing/strategies/torch.py:958: FutureWarning: `load_state_dict` is deprecated and will be removed in future versions. Please use `load` instead.
+  checkpoint.load_state_dict(
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/planner_helpers.py:418: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  device = getattr(value, "device", None)
+/usr/local/lib/python3.12/dist-packages/torch/distributed/checkpoint/default_planner.py:479: FutureWarning: Please use DTensor instead and we are deprecating ShardedTensor.
+  and md.size != obj.size()
+/usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py:4876: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  warnings.warn(  # warn only once
+[2026-03-28 06:26:54] model.py:1155 - Saving model in HuggingFace format to /mnt/weka/shrd/k2m/hongyi.wang/checkpoint_miles/Qwen3-30B-A3B-Base-off2-pr2-klpost1e3/hf/rollout_0099
+srun: got SIGCONT
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+[2026-03-28T06:29:28.700] error: *** JOB 1513500 ON fs-mbz-gpu-778 CANCELLED AT 2026-03-28T06:29:28 DUE to SIGNAL Terminated ***
+srun: forcing job termination
+[2026-03-28T06:29:28.700] error: *** STEP 1513500.0 ON fs-mbz-gpu-778 CANCELLED AT 2026-03-28T06:29:28 DUE to SIGNAL Terminated ***
+Stack (most recent call first):
+  File Stack (most recent call first):
+  File "/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/model_bridge.py", line 641 in "/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/model_bridge.py"stream_weights_megatron_to_hf
+  File , line 641 in Stack (most recent call first):
+"/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/hf_pretrained/state.py  File "stream_weights_megatron_to_hf
+  File , line 701 in save_generator
+  File ""/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/model_bridge.py/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/hf_pretrained/state.py"Stack (most recent call first):
+Stack (most recent call first):
+"/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py"  File ", line , line 701641 in  in save_generator, line 
+  File 475  File  in stream_weights_megatron_to_hf"save_hf_weights
+/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/model_bridge.pyStack (most recent call first):
+""
+/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py  File   File ""Stack (most recent call first):
+", line   File "641 in /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/hf_pretrained/state.py/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/model_bridge.py, line /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py""475" in , line "stream_weights_megatron_to_hf, line 
+  File save_hf_weights421 in save_hf_pretrained
+  File ""/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/model_bridge.py", line , line 641 in /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/model_bridge.py701  File 
+ in /root/miles/miles/backends/megatron_utils/model.py  File "save_generator
+  File ", line /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py1164641" in "" in /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/hf_pretrained/state.pystream_weights_megatron_to_hf", line 701 in stream_weights_megatron_to_hf
+", line save_hf_model641/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py, line 
+save_generator  File  in 
+"421
+ in   File   File   File save_hf_pretrained", line /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/hf_pretrained/state.pystream_weights_megatron_to_hf"
+475""
+/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/hf_pretrained/state.py  File "  File " in /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py, line /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.pysave_hf_weights"", line 701701", line "475
+ in  in , line /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/hf_pretrained/state.py122save_generatorsave_generator/root/miles/miles/backends/megatron_utils/model.py in   File " in 
+
+"save_hf_weights  File "  File , line main1164
+ in , line   File 
+/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py"701  File """"/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py, line /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py421save_hf_model in /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.pysave_generator""
+ in   File save_hf_pretrained"
+", line 
+, line   File ", line 421  File 137475, line  in 475/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py in  in ""<module>/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py in ""save_hf_pretrainedsave_hf_weights
+, line save_hf_weights/root/miles/miles/backends/megatron_utils/model.py
+
+, line   File 122
+ in 475"  File "  File  in /usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.pysave_hf_weights""main, line "
+/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py/root/miles/miles/backends/megatron_utils/model.py
+"  File 1164, line   File 421" in  in ", line /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.pysave_hf_pretrained"save_hf_model/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py, line 1164"
+
+"421, line  in   File   File  in 137, line save_hf_modelsave_hf_pretrained
+ in 
+421  File ""<module> in   File /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py/root/miles/miles/backends/megatron_utils/model.py
+save_hf_pretrained""""/root/miles/miles/backends/megatron_utils/model.py
+"/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py, line "  File , line 122, line 1164 in 1164, line main in  in "122
+ in   File /root/miles/miles/backends/megatron_utils/model.pysave_hf_model"
+main"  File save_hf_model
+, line   File /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py
+1164" in ""  File , line /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py"137save_hf_model"
+ in   File "<module>/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py, line 
+, line ""137122/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py in , line  in "<module>122
+main in 
+, line   File 122"main in /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py
+"  File ", line main/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py
+137  File " in <module>
+", line /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py137" in <module>, line 
+137 in <module>
+W0328 06:29:28.700000 3486932 torch/distributed/elastic/agent/server/api.py:725] Received 15 death signal, shutting down workers
+W0328 06:29:28.702000 3486932 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3487530 closing signal SIGTERM
+W0328 06:29:28.703000 3486932 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3487531 closing signal SIGTERM
+Stack (most recent call first):
+  File "/usr/local/lib/python3.12/dist-packages/safetensors/torch.py", line 307 in save_file
+  File "/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/hf_pretrained/state.py", line 756 in save_generator
+  File "/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py", line 475 in save_hf_weights
+  File "/usr/local/lib/python3.12/dist-packages/megatron/bridge/models/conversion/auto_bridge.py", line 421 in save_hf_pretrained
+  File "/root/miles/miles/backends/megatron_utils/model.py", line 1164 in save_hf_model
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 122 in main
+  File "/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py", line 137 in <module>
+W0328 06:29:28.705000 3486932 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3487532 closing signal SIGTERM
+W0328 06:29:28.705000 3486932 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3487533 closing signal SIGTERM
+W0328 06:29:28.706000 3486932 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3487534 closing signal SIGTERM
+W0328 06:29:28.706000 3486932 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3487535 closing signal SIGTERM
+W0328 06:29:28.706000 3486932 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3487536 closing signal SIGTERM
+W0328 06:29:28.707000 3486932 torch/distributed/elastic/multiprocessing/api.py:908] Sending process 3487537 closing signal SIGTERM
