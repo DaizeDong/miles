@@ -28,7 +28,7 @@ def test_router_replay_artifact_paths_and_bundle_loading(tmp_path):
         artifact_paths["main"],
     )
     with open(artifact_paths["predictive_metrics"], "w", encoding="utf-8") as f:
-        json.dump({"aggregates": {"predictive_loss": 1.25}}, f)
+        json.dump({"aggregates": {"predictive_loss": 1.25}, "debug": {"selected_total_tokens": 128}}, f)
     torch.save(
         {"layers": {"0": {"old_logits": torch.randn(2, 4)}}},
         artifact_paths["predictive_metric_tensors"],
@@ -37,6 +37,7 @@ def test_router_replay_artifact_paths_and_bundle_loading(tmp_path):
     bundle = load_router_replay_artifact_bundle(artifact_paths["main"])
     assert bundle["main"]["step"] == "training_7_mini3"
     assert bundle["predictive_metrics"]["aggregates"]["predictive_loss"] == 1.25
+    assert bundle["predictive_metrics"]["debug"]["selected_total_tokens"] == 128
     assert "layers" in bundle["predictive_metric_tensors"]
 
     sidecar_paths = get_router_replay_sidecar_paths(artifact_paths["main"])

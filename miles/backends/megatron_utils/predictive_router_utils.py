@@ -1,5 +1,6 @@
+import zlib
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -19,6 +20,10 @@ class RecordedPredictiveMicrobatch:
     sample_lengths: list[int]
     total_token_count: int
     predictive_loss_scale: float
+    original_total_tokens: int = 0
+    selected_total_tokens: int = 0
+    selected_sample_lengths: list[int] = field(default_factory=list)
+    debug_payload: dict[str, object] | None = None
 
     @property
     def has_valid_samples(self) -> bool:
@@ -49,6 +54,15 @@ def _to_cpu_storage_tensor(value: torch.Tensor) -> torch.Tensor:
     cpu_value = torch.empty_like(value, device="cpu", pin_memory=True)
     cpu_value.copy_(value, non_blocking=False)
     return cpu_value
+
+
+def _tensor_checksum(value: torch.Tensor | None) -> str | None:
+    if value is None:
+        return None
+    tensor = value.detach().cpu().contiguous()
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.to(torch.float32)
+    return f"{zlib.crc32(tensor.numpy().tobytes()) & 0xFFFFFFFF:08x}"
 
 
 def _get_local_packed_token_count(
@@ -136,11 +150,10 @@ def build_local_predictive_sample_lengths(
 def build_sampled_token_mask(
     *,
     sample_lengths: Sequence[int],
-    sampled_indices: Sequence[int],
+    sampled_token_counts: dict[int, int],
     total_token_count: int,
 ) -> torch.Tensor:
     valid_mask = torch.zeros(total_token_count, dtype=torch.bool)
-    sampled_index_set = set(int(index) for index in sampled_indices)
 
     offset = 0
     for sample_idx, sample_length in enumerate(sample_lengths):
@@ -151,11 +164,104 @@ def build_sampled_token_mask(
                 f"sample_lengths sum exceeded total_token_count: offset={offset}, sample_length={sample_length}, "
                 f"total_token_count={total_token_count}"
             )
-        if sample_idx in sampled_index_set and sample_length > 0:
-            valid_mask[offset:next_offset] = True
+        keep_count = int(sampled_token_counts.get(sample_idx, 0))
+        if keep_count > sample_length:
+            raise ValueError(
+                f"sampled keep_count exceeded sample_length: sample_idx={sample_idx}, "
+                f"keep_count={keep_count}, sample_length={sample_length}"
+            )
+        if keep_count > 0:
+            valid_mask[offset : offset + keep_count] = True
         offset = next_offset
 
     return valid_mask
+
+
+def _allocate_balanced_keep_counts(lengths: Sequence[int], max_tokens: int | None) -> list[int]:
+    lengths = [int(length) for length in lengths]
+    total_tokens = sum(lengths)
+    if max_tokens is None or int(max_tokens) <= 0 or total_tokens <= int(max_tokens):
+        return list(lengths)
+
+    keep_counts = [0 for _ in lengths]
+    remaining_lengths = list(lengths)
+    remaining_tokens = int(max_tokens)
+    active_indices = [idx for idx, length in enumerate(remaining_lengths) if length > 0]
+
+    while remaining_tokens > 0 and active_indices:
+        per_sample_share = max(1, remaining_tokens // len(active_indices))
+        next_active_indices = []
+        for idx in active_indices:
+            if remaining_tokens <= 0:
+                break
+            take = min(remaining_lengths[idx], per_sample_share, remaining_tokens)
+            if take > 0:
+                keep_counts[idx] += take
+                remaining_lengths[idx] -= take
+                remaining_tokens -= take
+            if remaining_lengths[idx] > 0:
+                next_active_indices.append(idx)
+        active_indices = next_active_indices
+
+    return keep_counts
+
+
+def _build_predictive_debug_payload(
+    *,
+    old_inputs_concat: torch.Tensor | None,
+    old_logits_concat: torch.Tensor | None,
+    valid_mask: torch.Tensor,
+    sampled_indices: Sequence[int],
+    sample_lengths: Sequence[int],
+    sampled_keep_counts: Sequence[int],
+    total_token_count: int,
+    original_total_tokens: int,
+    selected_total_tokens: int,
+    predictive_loss_scale: float,
+    storage_dtype: str,
+    downsample_batch_size: int | None,
+    max_len_limit: int | None,
+    max_total_tokens: int | None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "sampled_indices": [int(index) for index in sampled_indices],
+        "sample_lengths": [int(length) for length in sample_lengths],
+        "sampled_original_lengths": [int(sample_lengths[index]) for index in sampled_indices],
+        "sampled_keep_counts": [int(length) for length in sampled_keep_counts],
+        "total_token_count": int(total_token_count),
+        "original_total_tokens": int(original_total_tokens),
+        "selected_total_tokens": int(selected_total_tokens),
+        "predictive_loss_scale": float(predictive_loss_scale),
+        "valid_mask_sum": int(valid_mask.sum().item()),
+        "valid_mask_numel": int(valid_mask.numel()),
+        "predictive_storage_dtype": storage_dtype,
+        "predictive_downsample_batch_size": (
+            None if downsample_batch_size is None else int(downsample_batch_size)
+        ),
+        "predictive_downsample_max_len_limit": None if max_len_limit is None else int(max_len_limit),
+        "predictive_max_total_tokens": None if max_total_tokens is None else int(max_total_tokens),
+        "capped_by_max_total_tokens": (
+            max_total_tokens is not None and selected_total_tokens < original_total_tokens
+        ),
+    }
+    if old_inputs_concat is None or old_logits_concat is None:
+        payload["old_inputs_concat_shape"] = None
+        payload["old_logits_concat_shape"] = None
+        payload["old_inputs_layer_checksums"] = {}
+        payload["old_logits_layer_checksums"] = {}
+        return payload
+
+    payload["old_inputs_concat_shape"] = list(old_inputs_concat.shape)
+    payload["old_logits_concat_shape"] = list(old_logits_concat.shape)
+    payload["old_inputs_layer_checksums"] = {
+        str(layer_idx): _tensor_checksum(old_inputs_concat[:, layer_idx, :])
+        for layer_idx in range(old_inputs_concat.shape[1])
+    }
+    payload["old_logits_layer_checksums"] = {
+        str(layer_idx): _tensor_checksum(old_logits_concat[:, layer_idx, :])
+        for layer_idx in range(old_logits_concat.shape[1])
+    }
+    return payload
 
 
 def pack_recorded_predictive_microbatch(
@@ -169,6 +275,7 @@ def pack_recorded_predictive_microbatch(
     allgather_cp: bool = False,
     downsample_batch_size: int | None = None,
     max_len_limit: int | None = None,
+    max_total_tokens: int | None = None,
     storage_dtype: str = "bf16",
     generator: torch.Generator | None = None,
 ) -> RecordedPredictiveMicrobatch:
@@ -186,6 +293,22 @@ def pack_recorded_predictive_microbatch(
             sample_lengths=[],
             total_token_count=0,
             predictive_loss_scale=1.0,
+            debug_payload=_build_predictive_debug_payload(
+                old_inputs_concat=None,
+                old_logits_concat=None,
+                valid_mask=empty_mask,
+                sampled_indices=[],
+                sample_lengths=[],
+                sampled_keep_counts=[],
+                total_token_count=0,
+                original_total_tokens=0,
+                selected_total_tokens=0,
+                predictive_loss_scale=1.0,
+                storage_dtype=storage_dtype,
+                downsample_batch_size=downsample_batch_size,
+                max_len_limit=max_len_limit,
+                max_total_tokens=max_total_tokens,
+            ),
         )
 
     token_count = int(recorded_old_inputs[0].shape[0])
@@ -222,27 +345,64 @@ def pack_recorded_predictive_microbatch(
         sample_ranges.append((offset, next_offset))
         offset = next_offset
 
+    original_total_tokens = sum(int(sample_lengths[sample_idx]) for sample_idx in sampled_indices)
+    sampled_original_lengths = [int(sample_lengths[sample_idx]) for sample_idx in sampled_indices]
+    sampled_keep_counts = _allocate_balanced_keep_counts(sampled_original_lengths, max_total_tokens)
+    sampled_token_counts = {
+        int(sample_idx): int(keep_count)
+        for sample_idx, keep_count in zip(sampled_indices, sampled_keep_counts, strict=True)
+        if int(keep_count) > 0
+    }
+    selected_total_tokens = sum(int(keep_count) for keep_count in sampled_keep_counts)
+
     valid_mask = build_sampled_token_mask(
         sample_lengths=sample_lengths,
-        sampled_indices=sampled_indices,
+        sampled_token_counts=sampled_token_counts,
         total_token_count=token_count,
     )
-    if not sampled_indices:
+    predictive_loss_scale = 1.0
+    if original_total_tokens > 0:
+        predictive_loss_scale = min(1.0, float(selected_total_tokens) / float(original_total_tokens))
+
+    if not sampled_token_counts:
         return RecordedPredictiveMicrobatch(
             old_inputs_concat=None,
             old_logits_concat=None,
             valid_mask=_to_cpu_storage_tensor(valid_mask),
-            sampled_indices=[],
+            sampled_indices=sampled_indices,
             sample_lengths=sample_lengths,
             total_token_count=token_count,
-            predictive_loss_scale=1.0,
+            predictive_loss_scale=predictive_loss_scale,
+            original_total_tokens=original_total_tokens,
+            selected_total_tokens=selected_total_tokens,
+            selected_sample_lengths=[int(length) for length in sampled_keep_counts],
+            debug_payload=_build_predictive_debug_payload(
+                old_inputs_concat=None,
+                old_logits_concat=None,
+                valid_mask=valid_mask,
+                sampled_indices=sampled_indices,
+                sample_lengths=sample_lengths,
+                sampled_keep_counts=sampled_keep_counts,
+                total_token_count=token_count,
+                original_total_tokens=original_total_tokens,
+                selected_total_tokens=selected_total_tokens,
+                predictive_loss_scale=predictive_loss_scale,
+                storage_dtype=storage_dtype,
+                downsample_batch_size=downsample_batch_size,
+                max_len_limit=max_len_limit,
+                max_total_tokens=max_total_tokens,
+            ),
         )
 
     target_dtype = predictive_storage_dtype_to_torch_dtype(storage_dtype)
     sampled_inputs_cpu = []
     sampled_logits_cpu = []
     for sample_idx in sampled_indices:
+        keep_count = int(sampled_token_counts.get(sample_idx, 0))
+        if keep_count <= 0:
+            continue
         start_idx, end_idx = sample_ranges[sample_idx]
+        end_idx = start_idx + keep_count
         sample_input = torch.stack(
             [old_input[start_idx:end_idx].detach() for old_input in recorded_old_inputs],
             dim=1,
@@ -260,11 +420,6 @@ def pack_recorded_predictive_microbatch(
 
     old_inputs_concat = torch.cat(sampled_inputs_cpu, dim=0)
     old_logits_concat = torch.cat(sampled_logits_cpu, dim=0)
-    original_total_tokens = sum(int(sample_length) for sample_length in sample_lengths)
-    selected_total_tokens = sum(int(sample_lengths[sample_idx]) for sample_idx in sampled_indices)
-    predictive_loss_scale = 1.0
-    if original_total_tokens > 0:
-        predictive_loss_scale = min(1.0, float(selected_total_tokens) / float(original_total_tokens))
 
     return RecordedPredictiveMicrobatch(
         old_inputs_concat=old_inputs_concat,
@@ -274,4 +429,23 @@ def pack_recorded_predictive_microbatch(
         sample_lengths=sample_lengths,
         total_token_count=token_count,
         predictive_loss_scale=predictive_loss_scale,
+        original_total_tokens=original_total_tokens,
+        selected_total_tokens=selected_total_tokens,
+        selected_sample_lengths=[int(length) for length in sampled_keep_counts],
+        debug_payload=_build_predictive_debug_payload(
+            old_inputs_concat=old_inputs_concat,
+            old_logits_concat=old_logits_concat,
+            valid_mask=valid_mask,
+            sampled_indices=sampled_indices,
+            sample_lengths=sample_lengths,
+            sampled_keep_counts=sampled_keep_counts,
+            total_token_count=token_count,
+            original_total_tokens=original_total_tokens,
+            selected_total_tokens=selected_total_tokens,
+            predictive_loss_scale=predictive_loss_scale,
+            storage_dtype=storage_dtype,
+            downsample_batch_size=downsample_batch_size,
+            max_len_limit=max_len_limit,
+            max_total_tokens=max_total_tokens,
+        ),
     )

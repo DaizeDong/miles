@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from miles.backends.megatron_utils.predictive_router_replay import (
+    PREDICTIVE_LAYER_SCALE_SCHEDULES,
     PredictiveRouterReplayBuffer,
     PredictiveRouterReplayState,
     PredictiveTrainStepState,
@@ -11,11 +13,14 @@ from miles.backends.megatron_utils.predictive_router_replay import (
     build_synthetic_predictive_loss,
     calculate_topk_accuracy,
     clear_predictive_optimizer_grads,
+    compute_predictive_layer_scale,
     compute_predictive_bias_ratio,
     compute_predictive_loss,
     disable_predictive_param_groups,
     get_predictive_replay_controller,
+    resolve_predictive_topk_margin_ratio,
     restore_predictive_param_groups,
+    stabilize_predictive_delta_logits,
 )
 from miles.backends.megatron_utils.predictive_router_utils import (
     RecordedPredictiveMicrobatch,
@@ -53,7 +58,46 @@ def test_pack_recorded_predictive_microbatch_builds_mask_and_storage():
     assert packed.old_logits_concat.dtype == torch.float16
     assert packed.old_inputs_concat.shape == torch.Size([2, 2, 3])
     assert packed.old_logits_concat.shape == torch.Size([2, 2, 4])
-    assert packed.predictive_loss_scale == 2.0 / 6.0
+    assert packed.original_total_tokens == 2
+    assert packed.selected_total_tokens == 2
+    assert packed.predictive_loss_scale == 1.0
+    assert packed.debug_payload["selected_total_tokens"] == 2
+    assert packed.debug_payload["capped_by_max_total_tokens"] is False
+
+
+def test_pack_recorded_predictive_microbatch_caps_total_tokens_after_sampling():
+    parallel_state = SimpleNamespace(cp_rank=0, cp_size=1)
+    recorded_old_inputs = [
+        torch.arange(18, dtype=torch.float32).reshape(6, 3),
+        torch.arange(18, 36, dtype=torch.float32).reshape(6, 3),
+    ]
+    recorded_old_logits = [
+        torch.arange(24, dtype=torch.float32).reshape(6, 4),
+        torch.arange(24, 48, dtype=torch.float32).reshape(6, 4),
+    ]
+
+    packed = pack_recorded_predictive_microbatch(
+        recorded_old_inputs=recorded_old_inputs,
+        recorded_old_logits=recorded_old_logits,
+        total_lengths=[2, 4],
+        parallel_state=parallel_state,
+        qkv_format="thd",
+        downsample_batch_size=2,
+        max_total_tokens=3,
+        storage_dtype="fp32",
+    )
+
+    assert packed.sampled_indices == [0, 1]
+    assert packed.selected_sample_lengths == [2, 1]
+    assert packed.valid_mask.tolist() == [True, True, True, False, False, False]
+    assert packed.old_inputs_concat.shape == torch.Size([3, 2, 3])
+    assert packed.old_logits_concat.shape == torch.Size([3, 2, 4])
+    assert packed.original_total_tokens == 6
+    assert packed.selected_total_tokens == 3
+    assert packed.predictive_loss_scale == 0.5
+    assert packed.debug_payload["sampled_keep_counts"] == [2, 1]
+    assert packed.debug_payload["capped_by_max_total_tokens"] is True
+    assert packed.debug_payload["predictive_max_total_tokens"] == 3
 
 
 def test_build_local_predictive_sample_lengths_uses_arithmetic_layout():
@@ -107,11 +151,13 @@ def test_predictive_router_replay_registry_and_metrics():
     PredictiveRouterReplayState.record_predictive_loss(1, 3.0)
     PredictiveRouterReplayState.record_predictive_bias_ratio(0, 2.0)
     PredictiveRouterReplayState.record_predictive_topk_accuracy(0, 0.25)
+    PredictiveRouterReplayState.record_predictive_scalar_metric("predictive_stabilizer_scale", 1, 0.5)
     metrics = PredictiveRouterReplayState.get_and_clear_predictive_metrics()
     assert metrics == {
         "predictive_loss": 2.0,
         "predictive_bias_to_logits_ratio": 2.0,
         "predictive_topk_accuracy": 0.25,
+        "predictive_stabilizer_scale": 0.5,
     }
     assert PredictiveRouterReplayState.get_and_clear_predictive_metrics() == {}
 
@@ -262,6 +308,101 @@ def test_compute_predictive_loss_variants_and_metrics():
     assert kl_post_loss.item() >= 0
     assert compute_predictive_bias_ratio(predicted_delta_logits, old_logits) > 0
     assert calculate_topk_accuracy(topk=1, logits1=old_logits + predicted_delta_logits, logits2=current_logits) == 1.0
+
+
+def test_compute_predictive_layer_scale_schedules_decay_with_depth():
+    assert PREDICTIVE_LAYER_SCALE_SCHEDULES == ("none", "linear_decay", "sqrt_decay", "cosine_decay")
+    assert compute_predictive_layer_scale(layer_idx=0, num_layers=48, schedule="none", min_scale=0.25) == 1.0
+    assert compute_predictive_layer_scale(layer_idx=0, num_layers=48, schedule="linear_decay", min_scale=0.25) == 1.0
+    assert compute_predictive_layer_scale(layer_idx=47, num_layers=48, schedule="linear_decay", min_scale=0.25) == 0.25
+    assert compute_predictive_layer_scale(layer_idx=47, num_layers=48, schedule="sqrt_decay", min_scale=0.4) == 0.4
+    mid_linear = compute_predictive_layer_scale(layer_idx=24, num_layers=48, schedule="linear_decay", min_scale=0.5)
+    mid_sqrt = compute_predictive_layer_scale(layer_idx=24, num_layers=48, schedule="sqrt_decay", min_scale=0.5)
+    assert 0.5 < mid_sqrt < mid_linear < 1.0
+
+
+def test_stabilize_predictive_delta_logits_applies_depth_gate_and_ratio_cap():
+    predicted_delta_logits = torch.full((2, 4), 4.0, dtype=torch.float32)
+    reference_logits = torch.full((2, 4), 10.0, dtype=torch.float32)
+
+    stabilized_delta_logits, metrics = stabilize_predictive_delta_logits(
+        predicted_delta_logits=predicted_delta_logits,
+        reference_logits=reference_logits,
+        layer_idx=47,
+        num_layers=48,
+        layer_scale_schedule="linear_decay",
+        layer_scale_min=0.5,
+        max_delta_to_old_ratio=0.1,
+    )
+
+    assert torch.allclose(stabilized_delta_logits, torch.full((2, 4), 1.0, dtype=torch.float32))
+    assert metrics["predictive_raw_bias_to_logits_ratio"] == pytest.approx(0.4)
+    assert metrics["predictive_stabilized_bias_to_logits_ratio"] == pytest.approx(0.1)
+    assert metrics["predictive_layer_gate_scale"] == pytest.approx(0.5)
+    assert metrics["predictive_ratio_clip_scale"] == pytest.approx(0.5)
+    assert metrics["predictive_stabilizer_scale"] == pytest.approx(0.25)
+
+
+def test_stabilize_predictive_delta_logits_applies_topk_margin_cap_without_flipping_topk():
+    reference_logits = torch.tensor([[3.0, 2.0, 0.0, -1.0]], dtype=torch.float32)
+    predicted_delta_logits = torch.tensor([[2.0, -2.0, 2.0, -2.0]], dtype=torch.float32)
+
+    stabilized_delta_logits, metrics = stabilize_predictive_delta_logits(
+        predicted_delta_logits=predicted_delta_logits,
+        reference_logits=reference_logits,
+        layer_idx=0,
+        num_layers=1,
+        layer_scale_schedule="none",
+        layer_scale_min=1.0,
+        max_delta_to_old_ratio=None,
+        topk=2,
+        max_delta_to_topk_margin_ratio=0.5,
+    )
+
+    assert torch.allclose(stabilized_delta_logits, predicted_delta_logits * 0.25)
+    assert metrics["predictive_margin_clip_scale_mean"] == pytest.approx(0.25)
+    assert metrics["predictive_margin_clip_scale_min"] == pytest.approx(0.25)
+    assert metrics["predictive_topk_boundary_margin_mean"] == pytest.approx(2.0)
+    assert calculate_topk_accuracy(topk=2, logits1=reference_logits, logits2=reference_logits + stabilized_delta_logits) == pytest.approx(1.0)
+
+
+def test_resolve_predictive_topk_margin_ratio_anneals_with_rollout():
+    ratio, progress = resolve_predictive_topk_margin_ratio(
+        base_ratio=1.0,
+        final_ratio=2.0,
+        anneal_start_rollout=80,
+        anneal_end_rollout=160,
+        current_rollout_id=120,
+    )
+
+    assert ratio == pytest.approx(1.5)
+    assert progress == pytest.approx(0.5)
+
+
+def test_stabilize_predictive_delta_logits_reports_effective_annealed_margin_ratio():
+    reference_logits = torch.tensor([[3.0, 2.0, 0.0, -1.0]], dtype=torch.float32)
+    predicted_delta_logits = torch.tensor([[3.0, -3.0, 3.0, -3.0]], dtype=torch.float32)
+
+    stabilized_delta_logits, metrics = stabilize_predictive_delta_logits(
+        predicted_delta_logits=predicted_delta_logits,
+        reference_logits=reference_logits,
+        layer_idx=0,
+        num_layers=1,
+        layer_scale_schedule="none",
+        layer_scale_min=1.0,
+        max_delta_to_old_ratio=None,
+        topk=2,
+        max_delta_to_topk_margin_ratio=1.0,
+        max_delta_to_topk_margin_ratio_final=2.0,
+        topk_margin_ratio_anneal_start_rollout=0,
+        topk_margin_ratio_anneal_end_rollout=10,
+        current_rollout_id=10,
+    )
+
+    assert torch.allclose(stabilized_delta_logits, predicted_delta_logits * (2.0 / 3.0))
+    assert metrics["predictive_effective_topk_margin_ratio"] == pytest.approx(2.0)
+    assert metrics["predictive_topk_margin_ratio_anneal_progress"] == pytest.approx(1.0)
+    assert metrics["predictive_margin_clip_scale_mean"] == pytest.approx(2.0 / 3.0)
 
 
 def test_ensure_bias_predictor_runtime_placement_preserves_parameter_identity():

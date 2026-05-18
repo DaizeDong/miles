@@ -3,6 +3,7 @@ from tests.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=60, suite="stage-a-cpu", labels=[])
 
 import asyncio
+import json
 from argparse import Namespace
 
 import pytest
@@ -176,6 +177,27 @@ class TestHealthCheck:
 
 
 class TestProxyIntegration:
+    def test_build_proxy_response_drops_stale_content_length_for_json(self, router_factory):
+        router = router_factory()
+        upstream_body = json.dumps({"text": "hello", "meta_info": {"finish_reason": {"type": "stop"}}}).encode("utf-8")
+
+        response = router._build_proxy_response(
+            {
+                "response_body": upstream_body,
+                "status_code": 200,
+                "headers": {
+                    "content-type": "application/json",
+                    "content-length": "999999",
+                    "transfer-encoding": "chunked",
+                },
+            }
+        )
+
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.headers["content-length"] == str(len(response.body))
+        assert response.headers["content-length"] != "999999"
+        assert "transfer-encoding" not in response.headers
+
     def test_proxy_forwards_request(self, router_env: RouterEnv, mock_worker: MockSGLangServer):
         requests.post(f"{router_env.url}/add_worker", params={"url": mock_worker.url}, timeout=5.0).raise_for_status()
 

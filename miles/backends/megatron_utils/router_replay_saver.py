@@ -25,6 +25,8 @@ def _empty_logits_cache() -> dict[str, list | dict]:
 
 def _empty_predictive_metric_tensor_cache() -> dict[str, list]:
     return {
+        "old_inputs": [],
+        "current_inputs": [],
         "old_logits": [],
         "current_logits": [],
         "predicted_delta_logits": [],
@@ -166,7 +168,12 @@ class RouterReplayLogitsSaver:
         self.save_threads.append(save_thread)
         self.save_threads = [thread for thread in self.save_threads if thread.is_alive()]
 
-    def _save_predictive_metrics_sync(self, metrics_data: dict[str, dict[str, float]], step: str | int) -> None:
+    def _save_predictive_metrics_sync(
+        self,
+        metrics_data: dict[str, dict[str, float]],
+        step: str | int,
+        debug_payload: dict[str, Any] | None = None,
+    ) -> None:
         try:
             if not metrics_data:
                 return
@@ -194,6 +201,8 @@ class RouterReplayLogitsSaver:
                 "aggregates": aggregates,
                 "per_layer": metrics_data,
             }
+            if debug_payload:
+                payload["debug"] = debug_payload
 
             filepath = artifact_paths["predictive_metrics"]
             with open(filepath, "w", encoding="utf-8") as f:
@@ -202,7 +211,12 @@ class RouterReplayLogitsSaver:
         except Exception:
             logger.exception("Failed to save predictive metrics sidecar for step %s", step)
 
-    def save_predictive_metrics_async(self, metrics_data: dict[str, dict[str, float]], step: str | int) -> None:
+    def save_predictive_metrics_async(
+        self,
+        metrics_data: dict[str, dict[str, float]],
+        step: str | int,
+        debug_payload: dict[str, Any] | None = None,
+    ) -> None:
         metrics_copy = {
             metric_name: {str(layer_idx): float(value) for layer_idx, value in per_layer.items()}
             for metric_name, per_layer in metrics_data.items()
@@ -210,10 +224,11 @@ class RouterReplayLogitsSaver:
         }
         if not metrics_copy:
             return
+        debug_copy = None if debug_payload is None else json.loads(json.dumps(debug_payload, sort_keys=True))
 
         save_thread = threading.Thread(
             target=self._save_predictive_metrics_sync,
-            args=(metrics_copy, step),
+            args=(metrics_copy, step, debug_copy),
             daemon=True,
         )
         save_thread.start()
