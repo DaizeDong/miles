@@ -182,8 +182,17 @@ local/
 **/rollout_data/
 **/buffer_stats/
 *.out
+*.err
 *.pkl
 *.code-workspace
+
+# Training-run artifacts (per-run dirs created by sbatch launchers)
+logs/
+logs_tmp/
+slurm-*.out
+slurm-*.err
+results/
+slurm_*.out
 
 .idea
 *.iml
