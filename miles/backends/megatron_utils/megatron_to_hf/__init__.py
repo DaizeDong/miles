@@ -8,6 +8,7 @@ from .qwen2 import convert_qwen2_to_hf
 from .qwen3_5_moe import convert_qwen3_5_moe_to_hf
 from .qwen3_next import convert_qwen3_next_to_hf
 from .qwen3moe import convert_qwen3moe_to_hf
+from ..predictive_router_replay import is_predictive_router_parameter_name
 
 
 # TODO unify w/ `convert_to_hf`
@@ -19,6 +20,11 @@ def postprocess_hf_param(args, megatron_param_name, hf_param_name, param):
 
 # TODO optimize code details
 def convert_to_hf(args, model_name, name, param, quantization_config=None):
+    if is_predictive_router_parameter_name(name):
+        # Predictive replay bias predictors are training-only auxiliaries.
+        # They should never appear in exported inference checkpoints.
+        return []
+
     param = remove_padding(name, param, args.vocab_size)
 
     converted_named_tensors = _convert_to_hf_core(args, model_name, name, param)

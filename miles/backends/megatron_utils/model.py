@@ -2,14 +2,19 @@ import copy
 import dataclasses
 import gc
 import inspect
+import json
 import logging
 import math
+import shutil
+import traceback
 from argparse import Namespace
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
@@ -28,6 +33,12 @@ from megatron.core.utils import get_model_config
 from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
+from miles.utils.hf_checkpoint_utils import (
+    HfSafetensorShardWriter,
+    copy_hf_non_weight_assets,
+    merge_missing_hf_tensors,
+)
+from miles.utils.hf_config_utils import get_hf_model_type, load_hf_config
 from miles.utils.memory_utils import clear_memory
 from miles.utils.replay_base import (
     RouterLogitsCacheAction,
@@ -70,8 +81,34 @@ from .predictive_train_schedule import (
 )
 from .predictive_router_utils import pack_recorded_predictive_microbatch
 from .router_replay_saver import RouterReplayLogitsSaver
+from .update_weight.common import rollout_sync_named_params_and_buffers
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _maybe_skip_megatron_output_fp32_conversion(enabled: bool):
+    """Optionally keep Megatron forward-only outputs in low precision.
+
+    Megatron's generic module wrapper promotes forward outputs to fp32 before
+    returning them. That is safe for training losses, but for actor
+    `compute_log_prob` it can transiently double the memory footprint of very
+    long `[T, V]` logits tensors. When enabled, this context temporarily turns
+    that promotion into a no-op; Miles then upcasts response chunks on demand
+    before the actual log-prob computation.
+    """
+    if not enabled:
+        yield
+        return
+
+    from megatron.core.transformer import module as megatron_transformer_module
+
+    original = megatron_transformer_module.float16_to_fp32
+    megatron_transformer_module.float16_to_fp32 = lambda val: val
+    try:
+        yield
+    finally:
+        megatron_transformer_module.float16_to_fp32 = original
 
 
 def _maybe_log_predictive_param_stats(
@@ -118,6 +155,8 @@ def _validate_predictive_main_grads(*, args: Namespace, role: str, model: Sequen
 
 from .bridge_lora_helpers import _ensure_model_list, _setup_lora_model_via_bridge  # noqa: F401
 from .lora_utils import save_lora_checkpoint
+from .update_weight.common import named_params_and_buffers
+from .update_weight.hf_weight_iterator_direct import HfWeightIteratorDirect
 
 
 def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig, role: str) -> dict | None:
@@ -336,6 +375,7 @@ def _collect_recorded_predictive_microbatch(
             allgather_cp=args.allgather_cp,
             downsample_batch_size=getattr(args, "predictive_downsample_batch_size", None),
             max_len_limit=getattr(args, "predictive_downsample_max_len_limit", None),
+            max_total_tokens=getattr(args, "predictive_max_total_tokens", None),
             storage_dtype=getattr(args, "predictive_storage_dtype", "fp32"),
         )
     )
@@ -428,6 +468,7 @@ def forward_only(
     parallel_state: ParallelState,
     store_prefix: str = "",
     record_router_logits: bool = False,
+    keep_output_in_low_precision: bool = False,
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -538,18 +579,19 @@ def forward_only(
     config.timers = None
     forward_data_store = []
     num_steps_per_rollout = len(num_microbatches)
-    for step_id in range(num_steps_per_rollout):
-        # collect_non_loss_data
-        forward_data_store += forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=data_iterator,
-            model=model,
-            num_microbatches=num_microbatches[step_id],
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            forward_only=True,
-            collect_non_loss_data=True,
-        )
+    with _maybe_skip_megatron_output_fp32_conversion(keep_output_in_low_precision):
+        for step_id in range(num_steps_per_rollout):
+            # collect_non_loss_data
+            forward_data_store += forward_backward_func(
+                forward_step_func=forward_step,
+                data_iterator=data_iterator,
+                model=model,
+                num_microbatches=num_microbatches[step_id],
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                forward_only=True,
+                collect_non_loss_data=True,
+            )
 
     # Move model back to the train mode.
     for model_module in model:
@@ -749,6 +791,10 @@ def train_one_step(
 
         if valid_step:
             if predictive_router_enabled:
+                get_predictive_replay_controller().record_predictive_param_stats(
+                    "before_optimizer_step",
+                    collect_predictive_param_stats(model),
+                )
                 _maybe_log_predictive_param_stats(
                     stage="before_optimizer_step",
                     model=model,
@@ -770,6 +816,10 @@ def train_one_step(
                 assert update_successful
                 opt_param_scheduler.step(increment=args.global_batch_size)
                 if predictive_router_enabled:
+                    get_predictive_replay_controller().record_predictive_param_stats(
+                        "after_optimizer_step",
+                        collect_predictive_param_stats(model),
+                    )
                     _maybe_log_predictive_param_stats(
                         stage="after_optimizer_step",
                         model=model,
@@ -950,20 +1000,24 @@ def train(
             predictive_controller.clear_predictive_metric_tensors()
 
         # Run training step.
-        loss_dict, grad_norm = train_one_step(
-            args,
-            rollout_id,
-            step_id,
-            data_iterator,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_microbatches[step_id],
-            parallel_state,
-            predictive_train_mode=resolved_predictive_train_mode,
-            router_logits_saver=router_logits_saver,
-            router_logits_step_name=router_logits_step_name,
-        )
+        predictive_controller.set_current_step_context(rollout_id=rollout_id, step_id=step_id)
+        try:
+            loss_dict, grad_norm = train_one_step(
+                args,
+                rollout_id,
+                step_id,
+                data_iterator,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_microbatches[step_id],
+                parallel_state,
+                predictive_train_mode=resolved_predictive_train_mode,
+                router_logits_saver=router_logits_saver,
+                router_logits_step_name=router_logits_step_name,
+            )
+        finally:
+            predictive_controller.clear_current_step_context()
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent
@@ -1001,6 +1055,19 @@ def train(
             predictive_metrics, predictive_metric_details = predictive_controller.get_and_clear_predictive_metrics_with_details()
 
         predictive_metric_tensors = predictive_controller.get_and_clear_predictive_metric_tensors()
+        predictive_debug_payload = predictive_controller.get_and_clear_predictive_debug_payload()
+        if predictive_debug_payload is not None:
+            predictive_debug_payload = dict(predictive_debug_payload)
+            predictive_debug_payload.update(
+                {
+                    "rollout_id": int(rollout_id),
+                    "step_id": int(step_id),
+                    "train_pass_index": int(train_pass_index),
+                    "num_train_passes": int(num_train_passes),
+                    "predictive_train_mode": resolved_predictive_train_mode,
+                    "router_logits_step_name": router_logits_step_name,
+                }
+            )
         predictive_controller.disable_predictive_metric_tensor_capture()
         if (
             router_logits_saver is not None
@@ -1013,7 +1080,11 @@ def train(
                     max_tokens=router_logits_saver.max_tokens,
                 )
             if mpu.get_data_parallel_rank() == 0:
-                router_logits_saver.save_predictive_metrics_async(predictive_metric_details, router_logits_step_name)
+                router_logits_saver.save_predictive_metrics_async(
+                    predictive_metric_details,
+                    router_logits_step_name,
+                    debug_payload=predictive_debug_payload,
+                )
                 if predictive_metric_tensors and any(predictive_metric_tensors.values()):
                     router_logits_saver.save_predictive_metric_tensors_async(
                         predictive_metric_tensors,
@@ -1141,45 +1212,48 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
     should_log = (
         mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
     )
+    is_writer_rank = should_log and mpu.get_pipeline_model_parallel_rank() == 0
+    path = Path(args.save_hf.format(rollout_id=rollout_id))
+    status_path = path.parent / f".save_hf_status_rollout_{rollout_id:04d}.json"
 
     try:
-        from megatron.bridge import AutoBridge
-        from transformers import AutoConfig
-
-        import miles_plugins.megatron_bridge  # noqa: F401
-
-        from miles.utils.megatron_bridge_utils import patch_megatron_model
-        from miles.utils.hf_checkpoint_utils import merge_missing_hf_tensors
-
-        path = Path(args.save_hf.format(rollout_id=rollout_id))
-
         if should_log:
             logger.info(f"Saving model in HuggingFace format to {path}")
 
-        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-
-        path.mkdir(parents=True, exist_ok=True)
-
-        with patch_megatron_model(model):
-            # For LoRA models, merge_adapter_weights=True (default) merges
-            # adapter weights into base weights for a standalone HF model.
-            bridge.save_hf_pretrained(model, path=path)
-
-        hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        if getattr(hf_config, "model_type", None) == "qwen3_5_moe":
-            merged_keys = merge_missing_hf_tensors(args.hf_checkpoint, path)
-            if should_log and merged_keys:
-                logger.info(
-                    "Restored %s untouched Qwen3.5 passthrough tensors (e.g. visual/MTP) into %s",
-                    len(merged_keys),
-                    path,
-                )
+        if getattr(args, "megatron_to_hf_mode", "raw") == "raw" and not is_lora_model(model):
+            _save_hf_model_raw(args, model, path, should_log=should_log, is_writer_rank=is_writer_rank)
+        else:
+            if should_log and getattr(args, "megatron_to_hf_mode", "raw") == "raw" and is_lora_model(model):
+                logger.info("Falling back to Megatron-Bridge for LoRA HF export in raw mode.")
+            _save_hf_model_bridge(args, model, path, should_log=should_log)
 
         if should_log:
             logger.info(f"Successfully saved merged HuggingFace model to {path}")
+        if is_writer_rank:
+            _write_save_hf_status(
+                status_path,
+                {
+                    "status": "ok",
+                    "path": str(path),
+                    "mode": getattr(args, "megatron_to_hf_mode", "raw"),
+                    "rollout_id": rollout_id,
+                },
+            )
     except Exception as e:
+        if is_writer_rank:
+            _write_save_hf_status(
+                status_path,
+                {
+                    "status": "error",
+                    "path": str(path),
+                    "mode": getattr(args, "megatron_to_hf_mode", "raw"),
+                    "rollout_id": rollout_id,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
         if should_log:
-            logger.error(f"Failed to save HuggingFace format: {e}")
+            logger.exception("Failed to save HuggingFace format")
 
     # Additionally save adapter-only checkpoint for LoRA models
     if is_lora_model(model):
@@ -1193,6 +1267,80 @@ def save_hf_model(args, rollout_id: int, model: Sequence[DDP]) -> None:
         except Exception as e:
             if should_log:
                 logger.error(f"Failed to save LoRA adapter: {e}")
+
+
+def _save_hf_model_bridge(args, model: Sequence[DDP], path: Path, *, should_log: bool) -> None:
+    from megatron.bridge import AutoBridge
+
+    import miles_plugins.megatron_bridge  # noqa: F401
+
+    from miles.utils.megatron_bridge_utils import patch_megatron_model
+
+    bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+
+    path.mkdir(parents=True, exist_ok=True)
+
+    with patch_megatron_model(model):
+        bridge.save_hf_pretrained(model, path=path)
+
+    if get_hf_model_type(args.hf_checkpoint) == "qwen3_5_moe":
+        merged_keys = merge_missing_hf_tensors(args.hf_checkpoint, path)
+        if should_log and merged_keys:
+            logger.info(
+                "Restored %s untouched Qwen3.5 passthrough tensors (e.g. visual/MTP) into %s",
+                len(merged_keys),
+                path,
+            )
+
+
+def _save_hf_model_raw(args, model: Sequence[DDP], path: Path, *, should_log: bool, is_writer_rank: bool) -> None:
+    hf_config = load_hf_config(args.hf_checkpoint, trust_remote_code=True)
+    model_name = args.model_name if getattr(args, "model_name", None) is not None else type(hf_config).__name__.lower()
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    megatron_local_weights = dict(rollout_sync_named_params_and_buffers(args, model, convert_to_global_name=True))
+    iterator = HfWeightIteratorDirect(
+        args,
+        model,
+        model_name=model_name,
+        quantization_config=quantization_config,
+        is_lora=False,
+    )
+
+    if dist.is_initialized():
+        dist.barrier()
+    if is_writer_rank:
+        shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(parents=True, exist_ok=True)
+    if dist.is_initialized():
+        dist.barrier()
+
+    writer = HfSafetensorShardWriter(path) if is_writer_rank else None
+    for chunk_idx, hf_named_tensors in enumerate(iterator.get_hf_weight_chunks(megatron_local_weights)):
+        if writer is None:
+            continue
+        shard_name = writer.add_chunk(hf_named_tensors)
+        if should_log and shard_name is not None:
+            logger.info("Saved HF shard %s for rollout export chunk %s", shard_name, chunk_idx)
+
+    if writer is not None:
+        writer.finalize()
+        if get_hf_model_type(args.hf_checkpoint) == "qwen3_5_moe":
+            merged_keys = merge_missing_hf_tensors(args.hf_checkpoint, path)
+            if should_log and merged_keys:
+                logger.info(
+                    "Restored %s untouched Qwen3.5 passthrough tensors (e.g. visual/MTP) into %s",
+                    len(merged_keys),
+                    path,
+                )
+        copy_hf_non_weight_assets(args.hf_checkpoint, path)
+
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def _write_save_hf_status(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2))
 
 
 def initialize_model_and_optimizer(

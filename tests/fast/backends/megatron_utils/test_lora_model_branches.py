@@ -203,3 +203,63 @@ class TestSaveLoRaBranch:
         save(42, model, MagicMock(), MagicMock())
 
         mock_save_ckpt.assert_called_once()
+
+
+class TestSaveHfModelBranch:
+    @patch(f"{_MODEL_MODULE}._write_save_hf_status")
+    @patch(f"{_MODEL_MODULE}._save_hf_model_raw")
+    @patch(f"{_MODEL_MODULE}.is_lora_model", return_value=False)
+    @patch(f"{_MODEL_MODULE}.mpu.get_pipeline_model_parallel_rank", return_value=0)
+    @patch(f"{_MODEL_MODULE}.mpu.get_tensor_model_parallel_rank", return_value=0)
+    @patch(f"{_MODEL_MODULE}.mpu.get_data_parallel_rank", return_value=0)
+    def test_raw_mode_routes_to_raw_export(
+        self,
+        _mock_dp,
+        _mock_tp,
+        _mock_pp,
+        _mock_is_lora,
+        mock_save_raw,
+        mock_write_status,
+    ):
+        from miles.backends.megatron_utils.model import save_hf_model
+
+        args = Namespace(
+            save_hf="/tmp/export/rollout_{rollout_id:04d}",
+            megatron_to_hf_mode="raw",
+            hf_checkpoint="/tmp/hf",
+            model_name=None,
+        )
+
+        save_hf_model(args, 3, [MagicMock()])
+
+        mock_save_raw.assert_called_once()
+        mock_write_status.assert_called_once()
+
+    @patch(f"{_MODEL_MODULE}._write_save_hf_status")
+    @patch(f"{_MODEL_MODULE}._save_hf_model_bridge")
+    @patch(f"{_MODEL_MODULE}.is_lora_model", return_value=False)
+    @patch(f"{_MODEL_MODULE}.mpu.get_pipeline_model_parallel_rank", return_value=0)
+    @patch(f"{_MODEL_MODULE}.mpu.get_tensor_model_parallel_rank", return_value=0)
+    @patch(f"{_MODEL_MODULE}.mpu.get_data_parallel_rank", return_value=0)
+    def test_bridge_mode_routes_to_bridge_export(
+        self,
+        _mock_dp,
+        _mock_tp,
+        _mock_pp,
+        _mock_is_lora,
+        mock_save_bridge,
+        mock_write_status,
+    ):
+        from miles.backends.megatron_utils.model import save_hf_model
+
+        args = Namespace(
+            save_hf="/tmp/export/rollout_{rollout_id:04d}",
+            megatron_to_hf_mode="bridge",
+            hf_checkpoint="/tmp/hf",
+            model_name=None,
+        )
+
+        save_hf_model(args, 4, [MagicMock()])
+
+        mock_save_bridge.assert_called_once()
+        mock_write_status.assert_called_once()

@@ -38,19 +38,23 @@ def get_responses(
     total_lengths: list[int],
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
+    apply_temperature: bool = False,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
-    After squeezing batch dimension and applying temperature scaling, this
-    function extracts the logits and tokens corresponding to response segments
-    for each sample. When context parallelism is disabled, it slices directly
-    from the concatenated sequence. With context parallelism enabled, it
-    handles split sequences across ranks.
+    After squeezing batch dimension, this function extracts the logits and
+    tokens corresponding to response segments for each sample. Optional
+    temperature scaling is applied on each response chunk instead of the full
+    logits tensor to keep memory bounded for long-sequence log-prob passes.
+    When context parallelism is disabled, it slices directly from the
+    concatenated sequence. With context parallelism enabled, it handles split
+    sequences across ranks.
 
     Args:
         logits: Model outputs with shape `[1, T, V]` (policy) or `[1, T, 1]`
             (value). Must be float32.
-        args: Configuration containing `rollout_temperature` for scaling.
+        args: Configuration containing `rollout_temperature` for optional
+            scaling.
         unconcat_tokens: List of token tensors (prompt+response) per sample.
         total_lengths: Total sequence lengths (prompt+response) per sample.
         response_lengths: Response segment lengths per sample.
@@ -62,7 +66,7 @@ def get_responses(
     """
     qkv_format = args.qkv_format
 
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    assert logits.is_floating_point(), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
 
     if qkv_format == "thd":
@@ -71,8 +75,6 @@ def get_responses(
     else:
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
-
-    logits = logits.div(args.rollout_temperature)
 
     cp_size = parallel_state.cp_size
     end = 0
@@ -137,6 +139,9 @@ def get_responses(
 
         seq_start += total_length
 
+        if apply_temperature and args.rollout_temperature != 1.0 and logits_chunk.numel() > 0:
+            logits_chunk = logits_chunk.div(args.rollout_temperature)
+
         yield logits_chunk, tokens_chunk
 
 
@@ -185,7 +190,10 @@ def get_log_probs_and_entropy(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
+        apply_temperature=True,
     ):
+        if logits_chunk.dtype != torch.float32:
+            logits_chunk = logits_chunk.float()
         log_prob, entropy = calculate_log_probs_and_entropy(
             logits_chunk,
             tokens_chunk,
@@ -238,8 +246,7 @@ def get_values(
 
     Args:
         logits: Value head output with shape `[1, T, 1]`.
-        args: Configuration (passed to `get_responses` which uses
-            `rollout_temperature` even though values don't need temperature).
+        args: Configuration used for response slicing only.
         unconcat_tokens: List of token tensors per sample.
         total_lengths: Total sequence lengths per sample.
         response_lengths: Response segment lengths per sample.
@@ -540,6 +547,8 @@ def policy_loss_function(
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
 
+    need_entropy = args.entropy_coef != 0.0
+
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
@@ -547,7 +556,7 @@ def policy_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        with_entropy=need_entropy,
         max_seq_lens=max_seq_lens,
     )
 
@@ -662,10 +671,12 @@ def policy_loss_function(
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
-    # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    if need_entropy:
+        entropy = log_probs_and_entropy["entropy"]
+        entropy = torch.cat(entropy, dim=0)
+        entropy_loss = sum_of_sample_mean(entropy)
+    else:
+        entropy_loss = pg_loss.new_zeros(())
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 

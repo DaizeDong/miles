@@ -7,15 +7,14 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-from transformers import AutoConfig
+
+from miles.utils.hf_config_utils import get_hf_text_config_dict, load_hf_config
 
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
 except ImportError:
     FusedRMSNormGated = None
-    Qwen3_5MoeRMSNorm = None
     ShortConvolution = None
     chunk_gated_delta_rule = None
 
@@ -24,6 +23,33 @@ from .hf_attention import HuggingfaceAttention
 
 def _get_text_config(hf_config):
     return hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+
+
+def _get_layer_types(hf_checkpoint: str, hf_config):
+    if hasattr(hf_config, "layer_types"):
+        return list(hf_config.layer_types)
+
+    text_config_dict = get_hf_text_config_dict(hf_checkpoint)
+    layer_types = text_config_dict.get("layer_types")
+    if layer_types is None:
+        raise AttributeError("Qwen3.5 config is missing text layer_types.")
+    return list(layer_types)
+
+
+class Qwen3_5MoeRMSNorm(nn.Module):
+    """Minimal RMSNorm compatible with Qwen3.5 checkpoint weights."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.float()
+        variance = hidden_states.pow(2).mean(dim=-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return (hidden_states * self.weight.float()).to(input_dtype)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -154,9 +180,6 @@ class Attention(HuggingfaceAttention):
         pg_collection=None,
     ):
         super().__init__(args, config, layer_number, cp_comm_type, pg_collection)
-        if Qwen3_5MoeRMSNorm is None:
-            raise ImportError("Please install transformers with qwen3_5_moe support to use Qwen3.5.")
-
         self.hf_config = _get_text_config(self.hf_config)
         self.linear_attn = Qwen3_5GatedDeltaNet(self.hf_config, self.hf_layer_idx)
         self.input_layernorm = Qwen3_5MoeRMSNorm(self.hf_config.hidden_size, eps=self.hf_config.rms_norm_eps)
@@ -180,9 +203,10 @@ def get_qwen3_5_spec(args, config, vp_stage):
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
     offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
 
-    hf_config = _get_text_config(AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True))
+    hf_config = _get_text_config(load_hf_config(args.hf_checkpoint, trust_remote_code=True))
+    layer_types = _get_layer_types(args.hf_checkpoint, hf_config)
     for layer_id in range(num_layers_to_build):
-        if hf_config.layer_types[layer_id + offset] == "linear_attention":
+        if layer_types[layer_id + offset] == "linear_attention":
             layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
             layer_specs.submodules.self_attention = ModuleSpec(module=Attention, params={"args": args})
             transformer_layer_spec.layer_specs[layer_id] = layer_specs

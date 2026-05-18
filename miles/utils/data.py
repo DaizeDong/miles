@@ -97,10 +97,7 @@ def filter_long_prompt(
     if processor:
         filtered_samples = []
         for sample in origin_samples:
-            from miles.utils.processing_utils import process_vision_info
-
-            multimodal_inputs = process_vision_info(sample.prompt, processor)
-            processor_output = processor(text=sample.prompt, **multimodal_inputs)
+            processor_output = processor(text=sample.prompt, **(sample.multimodal_inputs or {}))
             input_ids = processor_output["input_ids"][0]
             if len(input_ids) <= max_length:
                 filtered_samples.append(sample)
@@ -250,12 +247,9 @@ class Dataset:
                 output_prompt = prompt
 
             if processor:
-                from miles.utils.processing_utils import process_vision_info
+                from miles.utils.processing_utils import process_vision_info, prompt_has_vision_inputs
 
-                assert isinstance(
-                    prompt, list
-                ), f"prompt must be a list when processor is not None, got {type(prompt)} instead"
-                multimodal_inputs = process_vision_info(prompt, processor)
+                multimodal_inputs = process_vision_info(prompt, processor) if prompt_has_vision_inputs(prompt) else None
             else:
                 multimodal_inputs = None
 

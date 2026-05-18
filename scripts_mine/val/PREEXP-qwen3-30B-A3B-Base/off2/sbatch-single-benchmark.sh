@@ -48,6 +48,8 @@ fi
 
 CONTAINER_IMAGE="${CONTAINER_IMAGE:-/mnt/weka/shrd/k2m/hongyi.wang/containers/verlai+verl+sgl055.latest.sqsh}"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/mnt/weka/shrd/k2m/haolong.jia:/mnt/weka/shrd/k2m/haolong.jia:rw,/mnt/weka/shrd/k2m/hongyi.wang:/mnt/weka/shrd/k2m/hongyi.wang:rw,/mnt/weka/home/hongyi.wang/workspace/rlhf/miles:/root/miles:rw,/mnt/weka/home/hongyi.wang/workspace/rlhf/verl:/root/verl:rw,/mnt/weka/home/hongyi.wang/workspace/rlhf/Megatron-LM-verl:/root/out-Megatron-LM:rw}"
+EVAL_RUNTIME_PYTHONPATH="${EVAL_RUNTIME_PYTHONPATH:-${RUNTIME_PYTHONPATH:-}}"
+EVAL_RUNTIME_PIP_INSTALL_COMMAND="${EVAL_RUNTIME_PIP_INSTALL_COMMAND:-${RUNTIME_PIP_INSTALL_COMMAND:-}}"
 
 echo "================================================================"
 echo "Starting evaluation"
@@ -81,6 +83,8 @@ import importlib.util
 required_packages = (
     ("math_verify", "math-verify"),
     ("tensordict", "tensordict>=0.8.0,<=0.10.0,!=0.9.0"),
+    ("torchdata", "torchdata"),
+    ("peft", "peft"),
     ("codetiming", "codetiming"),
 )
 
@@ -98,6 +102,11 @@ if [ "${#missing_pkgs[@]}" -gt 0 ]; then
   }
 fi
 
+if [ -n "${EVAL_RUNTIME_PIP_INSTALL_COMMAND:-}" ]; then
+  echo "[INFO] running eval runtime pip install command"
+  bash -lc "${EVAL_RUNTIME_PIP_INSTALL_COMMAND}"
+fi
+
 bash /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/run_eval_one.sh
 EOF
 )"
@@ -109,5 +118,5 @@ srun \
   --container-image="${CONTAINER_IMAGE}" \
   --container-mounts="${CONTAINER_MOUNTS}" \
   --export=ALL \
-  env DATA_ROOT="${DATA_ROOT_IN_CONTAINER}" RESULTS_ROOT="${RESULTS_ROOT_IN_CONTAINER}" RESULTS_ROOT_HOST="${RESULTS_ROOT_HOST}" AUTO_CKPT_EVAL_EXPORT_ROOT="${EXPORT_ROOT_IN_CONTAINER}" AUTO_CKPT_EVAL_EXPORT_SERIES_NAME="${AUTO_CKPT_EVAL_EXPORT_SERIES_NAME:-}" \
+  env DATA_ROOT="${DATA_ROOT_IN_CONTAINER}" RESULTS_ROOT="${RESULTS_ROOT_IN_CONTAINER}" RESULTS_ROOT_HOST="${RESULTS_ROOT_HOST}" AUTO_CKPT_EVAL_EXPORT_ROOT="${EXPORT_ROOT_IN_CONTAINER}" AUTO_CKPT_EVAL_EXPORT_SERIES_NAME="${AUTO_CKPT_EVAL_EXPORT_SERIES_NAME:-}" EVAL_RUNTIME_PYTHONPATH="${EVAL_RUNTIME_PYTHONPATH}" EVAL_RUNTIME_PIP_INSTALL_COMMAND="${EVAL_RUNTIME_PIP_INSTALL_COMMAND}" \
   bash -lc "${CONTAINER_CMD}"

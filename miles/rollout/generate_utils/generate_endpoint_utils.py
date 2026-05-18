@@ -17,7 +17,7 @@ def compute_prompt_ids_from_sample(state, sample, tools=None):
     prompt = sample.prompt
 
     if state.processor:
-        processor_output = state.processor(text=prompt, **sample.multimodal_inputs)
+        processor_output = state.processor(text=prompt, **(sample.multimodal_inputs or {}))
         prompt_ids = processor_output["input_ids"][0]
 
         # TODO shall we move it to other places? then can make this function immutable

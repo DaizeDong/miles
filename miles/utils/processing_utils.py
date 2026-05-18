@@ -54,6 +54,32 @@ def process_vision_info(prompt, processor):
     return multimodal_inputs
 
 
+def prompt_has_vision_inputs(prompt) -> bool:
+    if not isinstance(prompt, list):
+        return False
+
+    for message in prompt:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            continue
+
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in {"image", "video"}:
+                return True
+            if "image" in item or "video" in item:
+                return True
+
+    return False
+
+
 def encode_image_for_rollout_engine(image) -> str:
     """Load an image from path, ensure RGB, encode as PNG base64 string."""
     buffer = io.BytesIO()

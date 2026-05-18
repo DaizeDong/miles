@@ -46,6 +46,8 @@ HF_MODEL_PATH="${HF_MODEL_PATH:-/mnt/weka/shrd/k2m/haolong.jia/checkpoint/${MODE
 REF_MODEL_PATH="${REF_MODEL_PATH:-/mnt/weka/shrd/k2m/haolong.jia/checkpoint_torch_dist/${MODEL_NAME}}"
 DATA_CACHE_ROOT="${DATA_CACHE_ROOT:-/mnt/weka/shrd/k2m/hongyi.wang/datasets_miles/PREEXP-${MODEL_NAME}}"
 MILES_TRAIN_FILE="${MILES_TRAIN_FILE:-${DATA_CACHE_ROOT}/dapo-math-17k-miles.jsonl}"
+MODEL_SCRIPT_PATH_IN_CONTAINER="${MODEL_SCRIPT_PATH_IN_CONTAINER:-/root/miles/scripts/models/qwen3-30B-A3B.sh}"
+EXPORT_HF_FROM_MEGATRON_SCRIPT_IN_CONTAINER="${EXPORT_HF_FROM_MEGATRON_SCRIPT_IN_CONTAINER:-/root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py}"
 if [ -z "${SAVE_HF_TEMPLATE:-}" ]; then
   SAVE_HF_TEMPLATE="$(printf '%s/hf/rollout_{rollout_id:04d}' "${CKPT_ROOT}")"
 fi
@@ -60,6 +62,8 @@ echo "  CKPT_ROOT: ${CKPT_ROOT}"
 echo "  HF_MODEL_PATH: ${HF_MODEL_PATH}"
 echo "  SAVE_HF_TEMPLATE: ${SAVE_HF_TEMPLATE}"
 echo "  EXPORT_STEP_LABEL: ${EXPORT_STEP_LABEL:-latest}"
+echo "  MODEL_SCRIPT_PATH_IN_CONTAINER: ${MODEL_SCRIPT_PATH_IN_CONTAINER}"
+echo "  EXPORT_HF_FROM_MEGATRON_SCRIPT_IN_CONTAINER: ${EXPORT_HF_FROM_MEGATRON_SCRIPT_IN_CONTAINER}"
 echo "  Node: $(hostname -s)"
 echo "  Job ID: ${SLURM_JOB_ID}"
 echo "================================================================"
@@ -78,9 +82,15 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEPRECATED_MEGATRON_COMPATIBLE=1
 export EXPORT_LOAD_PATH="${EXPORT_LOAD_PATH:-${CKPT_ROOT}}"
 export MEGATRON_LOAD_PATH="${MEGATRON_LOAD_PATH:-${CKPT_ROOT}}"
-SCRIPT_DIR="$(cd -- "$(dirname -- "/root/miles/scripts/run-qwen3-30B-A3B.sh")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
-torchrun --nproc-per-node 8 /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Base/off2/export_hf_from_megatron.py \
+source "${MODEL_SCRIPT_PATH_IN_CONTAINER}"
+EXTRA_ARGS=()
+if [ -n "${CHAT_TEMPLATE_PATH:-}" ]; then
+  EXTRA_ARGS+=(--chat-template-path "${CHAT_TEMPLATE_PATH}")
+fi
+if [ -n "${APPLY_CHAT_TEMPLATE_KWARGS:-}" ]; then
+  EXTRA_ARGS+=(--apply-chat-template-kwargs "${APPLY_CHAT_TEMPLATE_KWARGS}")
+fi
+torchrun --nproc-per-node 8 "'"${EXPORT_HF_FROM_MEGATRON_SCRIPT_IN_CONTAINER}"'" \
   "${MODEL_ARGS[@]}" \
   --hf-checkpoint "'"${HF_MODEL_PATH}"'" \
   --ref-load "'"${REF_MODEL_PATH}"'" \
@@ -104,6 +114,7 @@ torchrun --nproc-per-node 8 /root/miles/scripts_mine/val/PREEXP-qwen3-30B-A3B-Ba
   --rollout-top-k -1 \
   --global-batch-size 8 \
   --balance-data \
+  "${EXTRA_ARGS[@]}" \
   --tensor-model-parallel-size 1 \
   --sequence-parallel \
   --pipeline-model-parallel-size 1 \

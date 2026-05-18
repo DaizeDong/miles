@@ -2,6 +2,8 @@ import re
 
 import torch
 
+from miles.utils.hf_config_utils import load_hf_config
+
 _TEXT_CONFIG_CACHE = {}
 _EXPERT_CACHE = {}
 
@@ -16,9 +18,7 @@ def _get_text_config(args):
     if hf_checkpoint is None:
         raise ValueError("Qwen3.5 export requires args.hf_checkpoint so the linear-attention dimensions can be read.")
     if hf_checkpoint not in _TEXT_CONFIG_CACHE:
-        from transformers import AutoConfig
-
-        hf_config = AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
+        hf_config = load_hf_config(hf_checkpoint, trust_remote_code=True)
         _TEXT_CONFIG_CACHE[hf_checkpoint] = hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
     return _TEXT_CONFIG_CACHE[hf_checkpoint]
 

@@ -3,6 +3,7 @@ import shutil
 from collections import defaultdict
 from pathlib import Path
 
+import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
@@ -70,6 +71,51 @@ def merge_missing_hf_tensors(origin_hf_dir, output_dir, chunk_size=DEFAULT_SAFET
     output_index["metadata"]["total_size"] = output_index["metadata"].get("total_size", 0) + total_added_size
     (output_dir / "model.safetensors.index.json").write_text(json.dumps(output_index, indent=2))
     return missing_keys
+
+
+class HfSafetensorShardWriter:
+    def __init__(self, output_dir):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._weight_map = {}
+        self._total_size = 0
+        self._num_shards = 0
+
+    def add_chunk(self, named_tensors):
+        named_tensors = list(named_tensors)
+        if not named_tensors:
+            return None
+
+        shard_name = f"model-{self._num_shards:05d}.safetensors"
+        shard_tensors = {}
+        for key, tensor in named_tensors:
+            cpu_tensor = self._to_cpu_tensor(tensor)
+            if key in self._weight_map:
+                raise ValueError(f"Duplicate HF tensor key during export: {key}")
+            shard_tensors[key] = cpu_tensor
+            self._weight_map[key] = shard_name
+            self._total_size += cpu_tensor.numel() * cpu_tensor.element_size()
+
+        save_file(shard_tensors, self.output_dir / shard_name)
+        self._num_shards += 1
+        return shard_name
+
+    def finalize(self):
+        if self._num_shards == 0:
+            raise RuntimeError(f"No HF tensor shards were written under {self.output_dir}")
+
+        index = {
+            "metadata": {"total_size": self._total_size},
+            "weight_map": self._weight_map,
+        }
+        (self.output_dir / "model.safetensors.index.json").write_text(json.dumps(index, indent=2))
+        return self._num_shards
+
+    @staticmethod
+    def _to_cpu_tensor(tensor):
+        if isinstance(tensor, torch.nn.Parameter):
+            tensor = tensor.data
+        return tensor.detach().cpu().contiguous()
 
 
 def _load_weight_index(model_dir: Path):

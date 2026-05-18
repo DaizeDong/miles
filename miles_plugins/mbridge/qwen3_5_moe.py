@@ -1,12 +1,64 @@
 import inspect
+from collections import OrderedDict
 
 import torch
 from mbridge.core import register_model
+from mbridge.core.safetensor_io import SafeTensorIO
 from mbridge.models import Qwen2MoEBridge
+
+from miles.utils.hf_config_utils import maybe_register_sglang_hf_configs
+
+maybe_register_sglang_hf_configs()
 
 
 def _get_text_config(hf_config):
     return hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
+
+
+class _Qwen3_5ExpertSafeTensorIO(SafeTensorIO):
+    _EXPERT_KEY_SEP = "#expert"
+
+    def __init__(self, hf_dir: str, max_cached_weights: int = 2):
+        super().__init__(hf_dir)
+        self.max_cached_weights = max_cached_weights
+        self._expert_tensor_cache = OrderedDict()
+
+    @classmethod
+    def make_expert_weight_name(cls, base_name: str, expert_id: int) -> str:
+        return f"{base_name}{cls._EXPERT_KEY_SEP}{expert_id}"
+
+    @classmethod
+    def parse_expert_weight_name(cls, weight_name: str):
+        if cls._EXPERT_KEY_SEP not in weight_name:
+            return None
+        base_name, expert_id = weight_name.rsplit(cls._EXPERT_KEY_SEP, 1)
+        if not expert_id.isdigit():
+            return None
+        return base_name, int(expert_id)
+
+    def _get_cached_expert_tensor(self, base_name: str) -> torch.Tensor:
+        tensor = self._expert_tensor_cache.pop(base_name, None)
+        if tensor is None:
+            tensor = super().load_one_hf_weight(base_name)
+        self._expert_tensor_cache[base_name] = tensor
+        while len(self._expert_tensor_cache) > self.max_cached_weights:
+            self._expert_tensor_cache.popitem(last=False)
+        return tensor
+
+    def load_some_hf_weight(self, hf_weight_names: list[str]) -> dict:
+        real_weight_names = []
+        expert_weight_names = []
+        for name in hf_weight_names:
+            if self.parse_expert_weight_name(name) is None:
+                real_weight_names.append(name)
+            else:
+                expert_weight_names.append(name)
+
+        ret = super().load_some_hf_weight(real_weight_names) if real_weight_names else {}
+        for name in expert_weight_names:
+            base_name, expert_id = self.parse_expert_weight_name(name)
+            ret[name] = self._get_cached_expert_tensor(base_name)[expert_id].contiguous()
+        return ret
 
 
 @register_model("qwen3_5moe")
@@ -72,6 +124,17 @@ class Qwen3_5MoeBridge(Qwen2MoEBridge):
     def text_config(self):
         return _get_text_config(self.hf_config)
 
+    def _get_safetensor_io(self, weights_path: str):
+        return _Qwen3_5ExpertSafeTensorIO(self._get_actual_hf_path(weights_path))
+
+    def _get_aggregated_expert_hf_name(self, mcore_weights_name: str) -> str:
+        layer_number = mcore_weights_name.split(".")[2]
+        if ".mlp.experts.linear_fc1" in mcore_weights_name:
+            return f"model.language_model.layers.{layer_number}.mlp.experts.gate_up_proj"
+        if ".mlp.experts.linear_fc2" in mcore_weights_name:
+            return f"model.language_model.layers.{layer_number}.mlp.experts.down_proj"
+        raise NotImplementedError(f"Unsupported parameter name: {mcore_weights_name}")
+
     def _build_config(self):
         text_config = self.text_config
         kwargs = {
@@ -122,13 +185,40 @@ class Qwen3_5MoeBridge(Qwen2MoEBridge):
             return [f"model.language_model.layers.{layer_number}.mlp.shared_expert.down_proj.weight"]
         if ".mlp.shared_experts.gate_weight" in name:
             return [f"model.language_model.layers.{layer_number}.mlp.shared_expert_gate.weight"]
-        if ".mlp.experts.linear_fc1.weight" in name:
-            return [f"model.language_model.layers.{layer_number}.mlp.experts.gate_up_proj"]
-        if ".mlp.experts.linear_fc2.weight" in name:
-            return [f"model.language_model.layers.{layer_number}.mlp.experts.down_proj"]
+        if ".mlp.experts.linear_fc1" in name:
+            expert_id = int(name.split("weight")[-1])
+            return [
+                _Qwen3_5ExpertSafeTensorIO.make_expert_weight_name(
+                    f"model.language_model.layers.{layer_number}.mlp.experts.gate_up_proj",
+                    expert_id,
+                )
+            ]
+        if ".mlp.experts.linear_fc2" in name:
+            expert_id = int(name.split("weight")[-1])
+            return [
+                _Qwen3_5ExpertSafeTensorIO.make_expert_weight_name(
+                    f"model.language_model.layers.{layer_number}.mlp.experts.down_proj",
+                    expert_id,
+                )
+            ]
         raise NotImplementedError(f"Unsupported parameter name: {name}")
 
     def _weight_to_hf_format(self, mcore_weights_name: str, mcore_weights: torch.Tensor):
+        if ".mlp.experts.linear_fc" in mcore_weights_name:
+            expert_id = int(mcore_weights_name.split("weight")[-1])
+            cache_key = self._get_aggregated_expert_hf_name(mcore_weights_name)
+            num_experts = self.text_config.num_experts
+            if not hasattr(self, "_expert_export_cache"):
+                self._expert_export_cache = {}
+            expert_cache = self._expert_export_cache.setdefault(cache_key, {})
+            expert_cache[expert_id] = mcore_weights
+            if len(expert_cache) < num_experts:
+                return [], []
+
+            stacked = torch.stack([expert_cache[idx] for idx in range(num_experts)], dim=0)
+            del self._expert_export_cache[cache_key]
+            return [cache_key], [stacked]
+
         hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
         text_config = self.text_config
         attention_output_gate = getattr(self.config, "attention_output_gate", False)
@@ -182,6 +272,10 @@ class Qwen3_5MoeBridge(Qwen2MoEBridge):
     def _weight_to_mcore_format(self, mcore_weights_name: str, hf_weights: list[torch.Tensor]) -> torch.Tensor:
         text_config = self.text_config
         attention_output_gate = getattr(self.config, "attention_output_gate", False)
+
+        if ".mlp.experts.linear_fc" in mcore_weights_name:
+            assert len(hf_weights) == 1
+            return hf_weights[0]
 
         if "self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name:
             assert len(hf_weights) == 3
