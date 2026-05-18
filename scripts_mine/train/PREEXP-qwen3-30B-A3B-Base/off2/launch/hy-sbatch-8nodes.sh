@@ -19,12 +19,21 @@ set -euo pipefail
 LAUNCH_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${LAUNCH_SCRIPT_DIR}/../../../../.." && pwd)"
 export MILES_REPO_ROOT="${MILES_REPO_ROOT:-${REPO_ROOT}}"
+export MILES_CONTAINER_REPO_ROOT="${MILES_CONTAINER_REPO_ROOT:-/root/miles}"
 
 resolve_repo_path() {
   local path="$1"
   case "$path" in
     /*) printf '%s\n' "$path" ;;
     *) printf '%s/%s\n' "${MILES_REPO_ROOT}" "${path#./}" ;;
+  esac
+}
+
+resolve_container_repo_path() {
+  local path="$1"
+  case "$path" in
+    /*) printf '%s\n' "$path" ;;
+    *) printf '%s/%s\n' "${MILES_CONTAINER_REPO_ROOT}" "${path#./}" ;;
   esac
 }
 
@@ -69,9 +78,15 @@ if [ -z "${SAVE_HF_TEMPLATE:-}" ]; then
   SAVE_HF_TEMPLATE="$(printf '%s/hf/rollout_{rollout_id:04d}' "${SAVE_PATH}")"
 fi
 export ROUTER_LOGITS_PATH="${ROUTER_LOGITS_PATH:-${SAVE_PATH}/router_logits}"
+case "${ROUTER_LOGITS_PATH}" in
+  disabled|DISABLED|none|NONE|off|OFF|0)
+    export ROUTER_LOGITS_PATH=""
+    ;;
+esac
 export ROUTER_LOGITS_SAVE_FREQ="${ROUTER_LOGITS_SAVE_FREQ:-10}"
 export ROUTER_LOGITS_MAX_TOKENS="${ROUTER_LOGITS_MAX_TOKENS-100000}"
 export CKPT_MONITOR_SCRIPT="$(resolve_repo_path "${CKPT_MONITOR_SCRIPT:-scripts_mine/train/ckpt_monitor_miles.sh}")"
+export CKPT_MONITOR_SCRIPT_IN_CONTAINER="${CKPT_MONITOR_SCRIPT_IN_CONTAINER:-$(resolve_container_repo_path "scripts_mine/train/ckpt_monitor_miles.sh")}"
 export CKPT_KEEP_LATEST="${CKPT_KEEP_LATEST:-1}"
 export CKPT_MONITOR_INTERVAL="${CKPT_MONITOR_INTERVAL:-120}"
 export CKPT_MONITOR_LOG="${CKPT_MONITOR_LOG:-${SAVE_PATH}/ckpt_monitor.host.log}"
@@ -106,8 +121,16 @@ export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES
 export MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-16384}"
 export EVAL_MAX_RESPONSE_LENGTH="${EVAL_MAX_RESPONSE_LENGTH:-16384}"
+export ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-}"
+export OVER_SAMPLING_BATCH_SIZE="${OVER_SAMPLING_BATCH_SIZE:-}"
+export DYNAMIC_SAMPLING_FILTER_PATH="${DYNAMIC_SAMPLING_FILTER_PATH:-}"
+export ENABLE_PARTIAL_ROLLOUT="${ENABLE_PARTIAL_ROLLOUT:-0}"
+export ENABLE_MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT="${ENABLE_MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT:-0}"
+export BUFFER_FILTER_PATH="${BUFFER_FILTER_PATH:-}"
+export ROLLOUT_SAMPLE_FILTER_PATH="${ROLLOUT_SAMPLE_FILTER_PATH:-}"
 export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-18432}"
 export LOG_PROBS_MAX_TOKENS_PER_GPU="${LOG_PROBS_MAX_TOKENS_PER_GPU:-}"
+export LOG_PROBS_CHUNK_SIZE="${LOG_PROBS_CHUNK_SIZE:-}"
 export TENSOR_MODEL_PARALLEL_SIZE="${TENSOR_MODEL_PARALLEL_SIZE:-1}"
 export PIPELINE_MODEL_PARALLEL_SIZE="${PIPELINE_MODEL_PARALLEL_SIZE:-1}"
 export CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
@@ -144,6 +167,19 @@ export BIAS_PREDICTOR_LOSS_TYPE="${BIAS_PREDICTOR_LOSS_TYPE:-kl-post}"
 export BIAS_PREDICTOR_LR_MULT="${BIAS_PREDICTOR_LR_MULT:-1e3}"
 export PREDICTIVE_DOWNSAMPLE_BATCH_SIZE="${PREDICTIVE_DOWNSAMPLE_BATCH_SIZE:-2}"
 export PREDICTIVE_DOWNSAMPLE_MAX_LEN_LIMIT="${PREDICTIVE_DOWNSAMPLE_MAX_LEN_LIMIT:-4096}"
+export PREDICTIVE_MAX_TOTAL_TOKENS="${PREDICTIVE_MAX_TOTAL_TOKENS:-}"
+export PREDICTIVE_MAX_HIDDEN_SHIFT_RELATIVE_NORM="${PREDICTIVE_MAX_HIDDEN_SHIFT_RELATIVE_NORM:-}"
+export PREDICTIVE_HIDDEN_SHIFT_WEIGHT_MODE="${PREDICTIVE_HIDDEN_SHIFT_WEIGHT_MODE:-binary}"
+export PREDICTIVE_BOUNDARY_LOSS_MAX_WEIGHT="${PREDICTIVE_BOUNDARY_LOSS_MAX_WEIGHT:-}"
+export PREDICTIVE_BOUNDARY_LOSS_MIN_MARGIN="${PREDICTIVE_BOUNDARY_LOSS_MIN_MARGIN:-1e-4}"
+export PREDICTIVE_MIN_POST_TOPK_MARGIN_FOR_FLIP="${PREDICTIVE_MIN_POST_TOPK_MARGIN_FOR_FLIP:-}"
+export PREDICTIVE_LAYER_SCALE_SCHEDULE="${PREDICTIVE_LAYER_SCALE_SCHEDULE:-none}"
+export PREDICTIVE_LAYER_SCALE_MIN="${PREDICTIVE_LAYER_SCALE_MIN:-1.0}"
+export PREDICTIVE_MAX_DELTA_TO_OLD_RATIO="${PREDICTIVE_MAX_DELTA_TO_OLD_RATIO:-}"
+export PREDICTIVE_MAX_DELTA_TO_TOPK_MARGIN_RATIO="${PREDICTIVE_MAX_DELTA_TO_TOPK_MARGIN_RATIO:-}"
+export PREDICTIVE_MAX_DELTA_TO_TOPK_MARGIN_RATIO_FINAL="${PREDICTIVE_MAX_DELTA_TO_TOPK_MARGIN_RATIO_FINAL:-}"
+export PREDICTIVE_TOPK_MARGIN_RATIO_ANNEAL_START_ROLLOUT="${PREDICTIVE_TOPK_MARGIN_RATIO_ANNEAL_START_ROLLOUT:-}"
+export PREDICTIVE_TOPK_MARGIN_RATIO_ANNEAL_END_ROLLOUT="${PREDICTIVE_TOPK_MARGIN_RATIO_ANNEAL_END_ROLLOUT:-}"
 export PREDICTIVE_STORAGE_DTYPE="${PREDICTIVE_STORAGE_DTYPE:-fp32}"
 export SGLANG_EP_NUM_REDUNDANT_EXPERTS="${SGLANG_EP_NUM_REDUNDANT_EXPERTS:-}"
 export ENABLE_NO_SAVE_OPTIM="${ENABLE_NO_SAVE_OPTIM:-0}"
@@ -166,6 +202,12 @@ export ENABLE_ASYNC_TRAIN="${ENABLE_ASYNC_TRAIN:-0}"
 export TRAIN_ENTRYPOINT="${TRAIN_ENTRYPOINT:-}"
 export ENABLE_KEEP_OLD_ACTOR="${ENABLE_KEEP_OLD_ACTOR:-0}"
 export UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
+export MODEL_SCRIPT_PATH_IN_CONTAINER="${MODEL_SCRIPT_PATH_IN_CONTAINER:-/root/miles/scripts/models/qwen3-30B-A3B.sh}"
+export PREDICTIVE_REPLAY_ARGS_SCRIPT_IN_CONTAINER="${PREDICTIVE_REPLAY_ARGS_SCRIPT_IN_CONTAINER:-/root/miles/scripts_mine/train/PREEXP-qwen3-30B-A3B-Base/off2/launch/_predictive_replay_args.sh}"
+export CHAT_TEMPLATE_PATH="${CHAT_TEMPLATE_PATH:-}"
+export APPLY_CHAT_TEMPLATE_KWARGS="${APPLY_CHAT_TEMPLATE_KWARGS:-}"
+export RUNTIME_PYTHONPATH="${RUNTIME_PYTHONPATH:-/root/Megatron-LM/}"
+export RUNTIME_PIP_INSTALL_COMMAND="${RUNTIME_PIP_INSTALL_COMMAND:-}"
 
 if [ "${EVAL_INTERVAL}" -eq 0 ]; then
   echo "[WARN] EVAL_INTERVAL=0 disables in-training eval and W&B eval curves."
@@ -444,9 +486,10 @@ echo "[INFO] MILES_EVAL_FILE=$MILES_EVAL_FILE"
 echo "[INFO] SAVE_PATH=$SAVE_PATH"
 echo "[INFO] CONTAINER_IMAGE=$CONTAINER_IMAGE"
 echo "[INFO] CKPT_MONITOR_SCRIPT=${CKPT_MONITOR_SCRIPT}"
+echo "[INFO] CKPT_MONITOR_SCRIPT_IN_CONTAINER=${CKPT_MONITOR_SCRIPT_IN_CONTAINER}"
 echo "[INFO] AUTO_CKPT_EVAL_MONITOR_SCRIPT=${AUTO_CKPT_EVAL_MONITOR_SCRIPT}"
 echo "[INFO] AUTO_CKPT_EVAL_RUNNER_SCRIPT=${AUTO_CKPT_EVAL_RUNNER_SCRIPT}"
-echo "[INFO] optional optimizations: no_save_optim=${ENABLE_NO_SAVE_OPTIM}, tp_comm_overlap=${ENABLE_TP_COMM_OVERLAP}, keep_old_actor=${ENABLE_KEEP_OLD_ACTOR}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, megatron_deepep=${ENABLE_MOE_DEEPEP}, sglang_ep_moe=${ENABLE_SGLANG_EP_MOE}, sglang_ep_size=${SGLANG_EXPERT_PARALLEL_SIZE}, sglang_ep_redundant=${SGLANG_EP_NUM_REDUNDANT_EXPERTS:-none}, sglang_dp_attention=${ENABLE_SGLANG_DP_ATTENTION}, sglang_dp_size=${SGLANG_DP_SIZE}, sglang_dp_lm_head=${ENABLE_SGLANG_DP_LM_HEAD}, sglang_deepep=${ENABLE_SGLANG_DEEPEP_MOE}, sglang_moe_a2a_backend=${SGLANG_MOE_A2A_BACKEND:-none}, sglang_moe_runner_backend=${SGLANG_MOE_RUNNER_BACKEND:-none}, sglang_mem_fraction=${SGLANG_MEM_FRACTION_STATIC}, sglang_max_running=${SGLANG_MAX_RUNNING_REQUESTS}, sglang_server_concurrency=${SGLANG_SERVER_CONCURRENCY}, use_routing_replay=${USE_ROUTING_REPLAY}, use_miles_router=${USE_MILES_ROUTER}, use_rollout_routing_replay=${USE_ROLLOUT_ROUTING_REPLAY}, predictive=${ENABLE_PREDICTIVE_ROUTING_REPLAY}, bias_predictor_loss=${BIAS_PREDICTOR_LOSS_TYPE}, bias_predictor_lr_mult=${BIAS_PREDICTOR_LR_MULT}, predictive_downsample_batch_size=${PREDICTIVE_DOWNSAMPLE_BATCH_SIZE}, predictive_downsample_max_len_limit=${PREDICTIVE_DOWNSAMPLE_MAX_LEN_LIMIT}, predictive_storage_dtype=${PREDICTIVE_STORAGE_DTYPE}, router_logits_path=${ROUTER_LOGITS_PATH:-disabled}, router_logits_save_freq=${ROUTER_LOGITS_SAVE_FREQ}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU:-none}, sglang_kv_cache_dtype=${SGLANG_KV_CACHE_DTYPE:-none}, sglang_cuda_graph_max=${SGLANG_CUDA_GRAPH_MAX}"
+echo "[INFO] optional optimizations: no_save_optim=${ENABLE_NO_SAVE_OPTIM}, tp_comm_overlap=${ENABLE_TP_COMM_OVERLAP}, keep_old_actor=${ENABLE_KEEP_OLD_ACTOR}, update_weights_interval=${UPDATE_WEIGHTS_INTERVAL}, megatron_deepep=${ENABLE_MOE_DEEPEP}, sglang_ep_moe=${ENABLE_SGLANG_EP_MOE}, sglang_ep_size=${SGLANG_EXPERT_PARALLEL_SIZE}, sglang_ep_redundant=${SGLANG_EP_NUM_REDUNDANT_EXPERTS:-none}, sglang_dp_attention=${ENABLE_SGLANG_DP_ATTENTION}, sglang_dp_size=${SGLANG_DP_SIZE}, sglang_dp_lm_head=${ENABLE_SGLANG_DP_LM_HEAD}, sglang_deepep=${ENABLE_SGLANG_DEEPEP_MOE}, sglang_moe_a2a_backend=${SGLANG_MOE_A2A_BACKEND:-none}, sglang_moe_runner_backend=${SGLANG_MOE_RUNNER_BACKEND:-none}, sglang_mem_fraction=${SGLANG_MEM_FRACTION_STATIC}, sglang_max_running=${SGLANG_MAX_RUNNING_REQUESTS}, sglang_server_concurrency=${SGLANG_SERVER_CONCURRENCY}, use_routing_replay=${USE_ROUTING_REPLAY}, use_miles_router=${USE_MILES_ROUTER}, use_rollout_routing_replay=${USE_ROLLOUT_ROUTING_REPLAY}, predictive=${ENABLE_PREDICTIVE_ROUTING_REPLAY}, bias_predictor_loss=${BIAS_PREDICTOR_LOSS_TYPE}, bias_predictor_lr_mult=${BIAS_PREDICTOR_LR_MULT}, predictive_downsample_batch_size=${PREDICTIVE_DOWNSAMPLE_BATCH_SIZE}, predictive_downsample_max_len_limit=${PREDICTIVE_DOWNSAMPLE_MAX_LEN_LIMIT}, predictive_max_total_tokens=${PREDICTIVE_MAX_TOTAL_TOKENS:-none}, predictive_max_hidden_shift_relative_norm=${PREDICTIVE_MAX_HIDDEN_SHIFT_RELATIVE_NORM:-none}, predictive_hidden_shift_weight_mode=${PREDICTIVE_HIDDEN_SHIFT_WEIGHT_MODE}, predictive_boundary_loss_max_weight=${PREDICTIVE_BOUNDARY_LOSS_MAX_WEIGHT:-none}, predictive_boundary_loss_min_margin=${PREDICTIVE_BOUNDARY_LOSS_MIN_MARGIN:-none}, predictive_min_post_topk_margin_for_flip=${PREDICTIVE_MIN_POST_TOPK_MARGIN_FOR_FLIP:-none}, predictive_layer_scale_schedule=${PREDICTIVE_LAYER_SCALE_SCHEDULE}, predictive_layer_scale_min=${PREDICTIVE_LAYER_SCALE_MIN}, predictive_max_delta_to_old_ratio=${PREDICTIVE_MAX_DELTA_TO_OLD_RATIO:-none}, predictive_max_delta_to_topk_margin_ratio=${PREDICTIVE_MAX_DELTA_TO_TOPK_MARGIN_RATIO:-none}, predictive_max_delta_to_topk_margin_ratio_final=${PREDICTIVE_MAX_DELTA_TO_TOPK_MARGIN_RATIO_FINAL:-none}, predictive_topk_margin_ratio_anneal_start_rollout=${PREDICTIVE_TOPK_MARGIN_RATIO_ANNEAL_START_ROLLOUT:-none}, predictive_topk_margin_ratio_anneal_end_rollout=${PREDICTIVE_TOPK_MARGIN_RATIO_ANNEAL_END_ROLLOUT:-none}, predictive_storage_dtype=${PREDICTIVE_STORAGE_DTYPE}, router_logits_path=${ROUTER_LOGITS_PATH:-disabled}, router_logits_save_freq=${ROUTER_LOGITS_SAVE_FREQ}, log_probs_max_tokens_per_gpu=${LOG_PROBS_MAX_TOKENS_PER_GPU:-none}, log_probs_chunk_size=${LOG_PROBS_CHUNK_SIZE:-none}, sglang_kv_cache_dtype=${SGLANG_KV_CACHE_DTYPE:-none}, sglang_cuda_graph_max=${SGLANG_CUDA_GRAPH_MAX}"
 
 require_host_script() {
   local label="$1"
@@ -494,8 +537,12 @@ set -x
 rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED || true
 
 cd /root/miles
+if [ -n "${RUNTIME_PIP_INSTALL_COMMAND}" ]; then
+  bash -lc "${RUNTIME_PIP_INSTALL_COMMAND}"
+fi
 pip install -e . --no-deps
-source /root/miles/scripts_mine/train/PREEXP-qwen3-30B-A3B-Base/off2/launch/_predictive_replay_args.sh
+source "${PREDICTIVE_REPLAY_ARGS_SCRIPT_IN_CONTAINER}"
+export PYTHONPATH="${RUNTIME_PYTHONPATH}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [ ! -d /root/Megatron-LM ]; then
   echo "[ERROR] /root/Megatron-LM not found in container." >&2
@@ -533,8 +580,8 @@ else
 fi
 echo "[INFO][${THIS_NODE}] THIS_IP=${THIS_IP} HEAD_IP=${HEAD_IP} HAS_NVLINK=${HAS_NVLINK}"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "/root/miles/scripts/run-qwen3-30B-A3B.sh")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${MODEL_SCRIPT_PATH_IN_CONTAINER}")" &>/dev/null && pwd)"
+source "${MODEL_SCRIPT_PATH_IN_CONTAINER}"
 
 if [ ! -f "/root/miles/${TRAIN_ENTRYPOINT}" ]; then
   echo "[ERROR] training entrypoint not found: /root/miles/${TRAIN_ENTRYPOINT}" >&2
@@ -597,6 +644,45 @@ ROLLOUT_ARGS=(
   --balance-data
 )
 
+if [ -n "${OVER_SAMPLING_BATCH_SIZE}" ]; then
+  ROLLOUT_ARGS+=(--over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE}")
+fi
+
+if [ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ]; then
+  ROLLOUT_ARGS+=(--dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER_PATH}")
+fi
+
+if [ "${ENABLE_PARTIAL_ROLLOUT}" = "1" ]; then
+  ROLLOUT_ARGS+=(--partial-rollout)
+fi
+
+if [ "${ENABLE_MASK_OFFPOLICY_IN_PARTIAL_ROLLOUT}" = "1" ]; then
+  ROLLOUT_ARGS+=(--mask-offpolicy-in-partial-rollout)
+fi
+
+if [ -n "${BUFFER_FILTER_PATH}" ]; then
+  ROLLOUT_ARGS+=(--buffer-filter-path "${BUFFER_FILTER_PATH}")
+fi
+
+if [ -n "${ROLLOUT_SAMPLE_FILTER_PATH}" ]; then
+  ROLLOUT_ARGS+=(--rollout-sample-filter-path "${ROLLOUT_SAMPLE_FILTER_PATH}")
+fi
+
+if [ -n "${ROLLOUT_STOP_TOKEN_IDS}" ]; then
+  # Deliberately split a whitespace-delimited token-id list into argv entries.
+  # shellcheck disable=SC2206
+  rollout_stop_token_ids=(${ROLLOUT_STOP_TOKEN_IDS})
+  ROLLOUT_ARGS+=(--rollout-stop-token-ids "${rollout_stop_token_ids[@]}")
+fi
+
+if [ -n "${CHAT_TEMPLATE_PATH}" ]; then
+  ROLLOUT_ARGS+=(--chat-template-path "${CHAT_TEMPLATE_PATH}")
+fi
+
+if [ -n "${APPLY_CHAT_TEMPLATE_KWARGS}" ]; then
+  ROLLOUT_ARGS+=(--apply-chat-template-kwargs "${APPLY_CHAT_TEMPLATE_KWARGS}")
+fi
+
 if [ -z "${REWARD_KEY}" ] && [ "${RM_TYPE}" = "dapo" ]; then
   export REWARD_KEY=score
 fi
@@ -642,6 +728,10 @@ PERF_ARGS=(
 
 if [ -n "${LOG_PROBS_MAX_TOKENS_PER_GPU}" ]; then
   PERF_ARGS+=(--log-probs-max-tokens-per-gpu "${LOG_PROBS_MAX_TOKENS_PER_GPU}")
+fi
+
+if [ -n "${LOG_PROBS_CHUNK_SIZE}" ]; then
+  PERF_ARGS+=(--log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE}")
 fi
 
 if [ "${ENABLE_TP_COMM_OVERLAP}" = "1" ]; then
@@ -887,7 +977,7 @@ PY
 
   RUNTIME_ENV_JSON="{
     \"env_vars\": {
-      \"PYTHONPATH\": \"/root/Megatron-LM/\",
+      \"PYTHONPATH\": \"${RUNTIME_PYTHONPATH}\",
       \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
       \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
       \"DEPRECATED_MEGATRON_COMPATIBLE\": \"1\",
@@ -904,7 +994,7 @@ PY
     echo "[HEAD] CKPT_MONITOR_LOG=${CKPT_MONITOR_LOG}"
     : > "${CKPT_MONITOR_LOG}"
     CKPT_MONITOR_INTERVAL="${CKPT_MONITOR_INTERVAL}" \
-      nohup bash "${CKPT_MONITOR_SCRIPT}" "${CKPT_KEEP_LATEST}" "${SAVE_PATH}" \
+      nohup bash "${CKPT_MONITOR_SCRIPT_IN_CONTAINER}" "${CKPT_KEEP_LATEST}" "${SAVE_PATH}" \
       >> "${CKPT_MONITOR_LOG}" 2>&1 < /dev/null &
     CKPT_MONITOR_PID=$!
     echo "[HEAD] CKPT_MONITOR_PID=${CKPT_MONITOR_PID}"
@@ -935,7 +1025,7 @@ PY
     kill "${CKPT_MONITOR_PID}" 2>/dev/null || true
     wait "${CKPT_MONITOR_PID}" 2>/dev/null || true
     echo "[HEAD] Running final checkpoint cleanup scan..."
-    bash "${CKPT_MONITOR_SCRIPT}" --once "${CKPT_KEEP_LATEST}" "${SAVE_PATH}" >> "${CKPT_MONITOR_LOG}" 2>&1 || true
+    bash "${CKPT_MONITOR_SCRIPT_IN_CONTAINER}" --once "${CKPT_KEEP_LATEST}" "${SAVE_PATH}" >> "${CKPT_MONITOR_LOG}" 2>&1 || true
   fi
   touch "${JOB_DONE_FILE}"
   ray stop --force || true
