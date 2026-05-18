@@ -3,7 +3,7 @@
 # kl-post + lr_mult=1e2, NO stabilization / NO flip-fallback / NO sample weighting.
 # This is the literal implementation of the PR^2 paper, used as the reference
 # point against which each Miles enhancement (A1..A6 individually, A7 all-on)
-# is measured. 1 epoch (NUM_ROLLOUT=270 ≈ DAPO-17k / batch=64).
+# is measured. 2 epochs (NUM_ROLLOUT=540 ≈ 2 × DAPO-17k / batch=64).
 #SBATCH --job-name=miles-off2-pr2-A0-klpost1e2-paper
 #SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
@@ -24,7 +24,7 @@ export RUN_POSTFIX="${RUN_POSTFIX:-off2-pr2-A0-klpost1e2-paper}"
 export RESOURCE_LAYOUT="${RESOURCE_LAYOUT:-disagg}"
 export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-4}"
 export NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-2}"
-export NUM_ROLLOUT="${NUM_ROLLOUT:-270}"
+export NUM_ROLLOUT="${NUM_ROLLOUT:-540}"
 export ENABLE_ASYNC_TRAIN="${ENABLE_ASYNC_TRAIN:-1}"
 export ENABLE_KEEP_OLD_ACTOR="${ENABLE_KEEP_OLD_ACTOR:-1}"
 export ENABLE_AUTO_CKPT_EVAL="${ENABLE_AUTO_CKPT_EVAL:-1}"
