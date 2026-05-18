@@ -5,7 +5,7 @@
 # This is the closest match to the production "stabilized + flipguard-wide"
 # preset from legacy scripts, ported to lr_mult=1e2.
 #SBATCH --job-name=miles-off2-pr2-A7-klpost1e2-allon
-#SBATCH --nodes=8
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gres=gpu:8
@@ -22,7 +22,7 @@ set -euo pipefail
 BASE_SCRIPT="/mnt/weka/home/hongyi.wang/workspace/rlhf/miles/scripts_mine/train/PREEXP-qwen3-30B-A3B-Base/off2/launch/hy-sbatch-8nodes.sh"
 export RUN_POSTFIX="${RUN_POSTFIX:-off2-pr2-A7-klpost1e2-allon}"
 export RESOURCE_LAYOUT="${RESOURCE_LAYOUT:-disagg}"
-export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-4}"
+export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
 export NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-2}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-540}"
 export ENABLE_ASYNC_TRAIN="${ENABLE_ASYNC_TRAIN:-1}"
