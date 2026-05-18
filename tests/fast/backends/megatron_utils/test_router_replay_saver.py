@@ -1,4 +1,24 @@
+import sys
+import types
+
 import torch
+
+if "megatron.core" not in sys.modules:
+    parallel_state_module = types.ModuleType("megatron.core.parallel_state")
+    parallel_state_module.get_data_parallel_rank = lambda *args, **kwargs: 0
+    parallel_state_module.get_tensor_model_parallel_rank = lambda *args, **kwargs: 0
+    parallel_state_module.get_pipeline_model_parallel_rank = lambda *args, **kwargs: 0
+    parallel_state_module.get_data_parallel_world_size = lambda *args, **kwargs: 1
+    parallel_state_module.get_tensor_model_parallel_world_size = lambda *args, **kwargs: 1
+
+    core_module = types.ModuleType("megatron.core")
+    core_module.parallel_state = parallel_state_module
+    megatron_module = types.ModuleType("megatron")
+    megatron_module.core = core_module
+
+    sys.modules["megatron"] = megatron_module
+    sys.modules["megatron.core"] = core_module
+    sys.modules["megatron.core.parallel_state"] = parallel_state_module
 
 from miles.backends.megatron_utils.router_replay_saver import (
     _truncate_predictive_metric_tensor_payload_tokens,
