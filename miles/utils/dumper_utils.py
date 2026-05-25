@@ -12,7 +12,16 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from sglang.srt.debug_utils.dumper import DumperConfig, _get_rank, dumper
+
+# AMD HPC Fund SIF pins a sglang version predating DumperConfig in
+# sglang.srt.debug_utils.dumper. Lazy-degrade if absent: callers should only
+# hit the DumperConfig path when args.dumper_enable is set (off by default).
+try:
+    from sglang.srt.debug_utils.dumper import DumperConfig, _get_rank, dumper
+except ImportError:  # pragma: no cover
+    DumperConfig = None
+    _get_rank = None
+    dumper = None
 
 logger = logging.getLogger(__name__)
 
