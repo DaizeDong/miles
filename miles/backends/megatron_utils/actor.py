@@ -611,6 +611,21 @@ class MegatronTrainRayActor(TrainRayActor):
             # The disable() context alone only prevents new allocations from being
             # tracked -- it does NOT restore previously paused/offloaded tensors.
             torch_memory_saver.resume()
+        # keep_old_actor's weights_backuper.backup() below reads the live GPU
+        # model parameters directly (via _source_getter). Under offload_train
+        # the actor is paused/offloaded by torch_memory_saver whenever
+        # update_weights() runs (startup: paused since model creation; in-loop:
+        # paused by the offload_train() call right before update_weights), so
+        # its GPU backing is gone -- reading those params raises
+        # `HIP error: illegal memory access`. resume() restores the backing;
+        # a matching pause() after the backup restores the paused state the
+        # rest of the offload state machine expects (so the next wake_up()
+        # does not abort with "Cannot resume ... not paused"). This mirrors
+        # the resume()/pause() pair the LoRA branch uses.
+        _tms_resumed_for_backup = False
+        if self.args.offload_train and getattr(self.args, "keep_old_actor", False):
+            torch_memory_saver.resume()
+            _tms_resumed_for_backup = True
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
@@ -636,7 +651,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("old_actor")
 
         if self.args.offload_train:
-            if is_lora_enabled(self.args):
+            if is_lora_enabled(self.args) or _tms_resumed_for_backup:
                 torch_memory_saver.pause()
             destroy_process_groups()
 
