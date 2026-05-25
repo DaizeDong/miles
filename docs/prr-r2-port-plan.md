@@ -9,7 +9,7 @@ Date: 2026-03-23
 
 - Phase A: completed
 - Phase B: completed
-- Phase C: pending
+- Phase C: completed
 - Phase D: pending
 - Phase E: pending
 
@@ -35,6 +35,20 @@ Date: 2026-03-23
   - `python -m compileall miles/backends/megatron_utils/predictive_router_replay.py miles/backends/megatron_utils/predictive_router_utils.py tests/fast/backends/megatron_utils/test_predictive_router_utils.py`
   - current shell Python is missing `torch`, so the new tensor-level fast test
     module could not be executed locally and was only syntax-checked
+- 2026-03-23: Completed Phase C. Wired predictive router replay into
+  `miles` model setup with a runtime `TopKRouter.forward` overlay, per-router
+  bias predictor attachment, and Megatron optimizer `config_overrides` keyed by
+  `ParamKey(attr=\"is_bias_predictor\")`.
+- 2026-03-23: Phase C design update:
+  - instead of extending `docker/patch/latest/megatron.patch` for predictive
+    logic, the port now layers a runtime patch on top of the existing Miles
+    routing replay patch
+  - this keeps the predictive delta isolated from the large Megatron patch file
+    and avoids requiring a new base patch rebuild just to iterate on PRR R2
+- 2026-03-23: Phase C verification status:
+  - `python -m compileall miles/backends/megatron_utils/model.py miles/backends/megatron_utils/predictive_router_replay.py`
+  - no Megatron runtime or `torch` package is available in the current shell,
+    so integration could only be syntax-checked locally
 
 ## 1. Goal
 
@@ -235,6 +249,15 @@ Acceptance criteria:
 ### Phase C: Megatron Patch Integration
 
 Extend the existing `miles` Megatron patch.
+
+Status:
+
+- completed on 2026-03-23
+
+Implementation note:
+
+- the predictive port now uses a runtime `TopKRouter.forward` overlay plus
+  post-build router attachment instead of expanding `docker/patch/latest/megatron.patch`
 
 Target file:
 
