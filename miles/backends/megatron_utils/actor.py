@@ -53,8 +53,17 @@ from .replay_utils import get_register_replay_list_func
 from .router_replay_saver import RouterReplayLogitsSaver
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
-from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
+
+# UpdateWeightP2P depends on a sglang ParallelismContext API that is absent in
+# the AMD HPC Fund SIF's pinned sglang version. Lazy-import to avoid breaking
+# actor.py at module load when p2p mode is not used (we use colocate or
+# broadcast on this cluster).
+try:
+    from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
+except ImportError as _e:  # pragma: no cover
+    UpdateWeightP2P = None
+    _update_weight_p2p_import_error = _e
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
@@ -199,6 +208,11 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.update_weight_transfer_mode == "broadcast":
                 update_weight_cls = UpdateWeightFromDistributed
             else:
+                if UpdateWeightP2P is None:
+                    raise RuntimeError(
+                        "UpdateWeightP2P is not importable in this environment "
+                        f"(SIF sglang version mismatch): {_update_weight_p2p_import_error}"
+                    )
                 update_weight_cls = UpdateWeightP2P
         self.weight_updater = update_weight_cls(
             self.args,
