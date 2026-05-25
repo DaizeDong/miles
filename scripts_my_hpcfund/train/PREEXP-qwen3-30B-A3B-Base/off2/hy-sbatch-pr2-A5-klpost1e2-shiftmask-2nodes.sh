@@ -1,0 +1,44 @@
+#!/bin/bash
+# === Ablation A5: A0 + hidden-shift sample masking ===
+# Only train predictor on tokens whose hidden state has drifted by more than
+# 0.02 (relative L2) since route recording. Binary mask. Paper uses uniform
+# token weighting.
+#SBATCH --job-name=miles-off2-pr2-A5-klpost1e2-shiftmask
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=128
+#SBATCH --account=hwang
+#SBATCH --partition=mi3008x
+#SBATCH --exclusive
+#SBATCH --time=12:00:00
+#SBATCH --output=/work1/hwang/dzdong/miles_logs_tmp/sbatch/%x.%J.%N.%t.log
+#SBATCH --error=/work1/hwang/dzdong/miles_logs_tmp/sbatch/%x.%J.%N.%t.err
+#SBATCH --open-mode=append
+
+set -euo pipefail
+
+BASE_SCRIPT="/home1/dzdong/workspace/miles/scripts_my_hpcfund/train/PREEXP-qwen3-30B-A3B-Base/off2/launch/hy-sbatch-2nodes.sh"
+export RUN_POSTFIX="${RUN_POSTFIX:-off2-pr2-A5-klpost1e2-shiftmask-hs002}"
+export RESOURCE_LAYOUT="${RESOURCE_LAYOUT:-disagg}"
+export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
+export NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-2}"
+export NUM_ROLLOUT="${NUM_ROLLOUT:-270}"
+export ENABLE_ASYNC_TRAIN="${ENABLE_ASYNC_TRAIN:-1}"
+export ENABLE_KEEP_OLD_ACTOR="${ENABLE_KEEP_OLD_ACTOR:-1}"
+export ENABLE_AUTO_CKPT_EVAL="${ENABLE_AUTO_CKPT_EVAL:-1}"
+export UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
+export USE_MILES_ROUTER="${USE_MILES_ROUTER:-1}"
+export USE_ROUTING_REPLAY="${USE_ROUTING_REPLAY:-1}"
+export USE_ROLLOUT_ROUTING_REPLAY="${USE_ROLLOUT_ROUTING_REPLAY:-0}"
+export ENABLE_PREDICTIVE_ROUTING_REPLAY="${ENABLE_PREDICTIVE_ROUTING_REPLAY:-1}"
+export BIAS_PREDICTOR_LOSS_TYPE="${BIAS_PREDICTOR_LOSS_TYPE:-kl-post}"
+export BIAS_PREDICTOR_LR_MULT="${BIAS_PREDICTOR_LR_MULT:-1e2}"
+export PREDICTIVE_DOWNSAMPLE_BATCH_SIZE="${PREDICTIVE_DOWNSAMPLE_BATCH_SIZE:-2}"
+export PREDICTIVE_DOWNSAMPLE_MAX_LEN_LIMIT="${PREDICTIVE_DOWNSAMPLE_MAX_LEN_LIMIT:-8192}"
+export PREDICTIVE_MAX_TOTAL_TOKENS="${PREDICTIVE_MAX_TOTAL_TOKENS:-4096}"
+export PREDICTIVE_STORAGE_DTYPE="${PREDICTIVE_STORAGE_DTYPE:-fp32}"
+# --- Enhancement under test ---
+export PREDICTIVE_MAX_HIDDEN_SHIFT_RELATIVE_NORM="${PREDICTIVE_MAX_HIDDEN_SHIFT_RELATIVE_NORM:-0.02}"
+export PREDICTIVE_HIDDEN_SHIFT_WEIGHT_MODE="${PREDICTIVE_HIDDEN_SHIFT_WEIGHT_MODE:-binary}"
+
+exec bash "${BASE_SCRIPT}"

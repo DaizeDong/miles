@@ -648,7 +648,6 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
-<<<<<<< HEAD
         if self.args.debug_skip_weight_update:
             if dist.get_rank() == 0:
                 logger.warning("Skipping actor-to-rollout weight update because " "--debug-skip-weight-update is set.")
@@ -656,7 +655,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 destroy_process_groups()
             return
 
-=======
         if self.args.offload_train and is_lora_enabled(self.args):
             # For LoRA, we must resume() to restore GPU memory backing for adapter
             # weights. Unlike base model weights (which are read from CPU backups),
@@ -679,7 +677,6 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.offload_train and getattr(self.args, "keep_old_actor", False):
             torch_memory_saver.resume()
             _tms_resumed_for_backup = True
->>>>>>> 502c07e0 (fix(megatron): resume torch_memory_saver during keep_old_actor backup)
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
@@ -705,11 +702,8 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.weights_backuper.backup("old_actor")
 
         if self.args.offload_train:
-<<<<<<< HEAD
-=======
             if is_lora_enabled(self.args) or _tms_resumed_for_backup:
                 torch_memory_saver.pause()
->>>>>>> 502c07e0 (fix(megatron): resume torch_memory_saver during keep_old_actor backup)
             destroy_process_groups()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:

@@ -192,5 +192,7 @@ glm/
 _examples_synced/
 .env
 .DS_Store
-
+.claude/
 .humanize/
+scripts_mine/wandb_key_sandy.txt
+scripts_my_hpcfund/wandb_key_sandy.txt
