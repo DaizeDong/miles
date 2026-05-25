@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 import socket
 from argparse import Namespace
@@ -68,6 +69,15 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
     ) -> int | None:
         monkey_patch_torch_dist()
+
+        # DIAGNOSTIC (opt-in via MILES_FAULTHANDLER_PERIOD): periodically dump
+        # every thread's Python stack to stderr. Used to pin where a hung rank
+        # is stuck when an MoE collective deadlocks with no NCCL-side error.
+        _fh_period = os.environ.get("MILES_FAULTHANDLER_PERIOD")
+        if _fh_period:
+            import faulthandler
+
+            faulthandler.dump_traceback_later(int(_fh_period), repeat=True)
 
         super().init(args, role, with_ref)
 
