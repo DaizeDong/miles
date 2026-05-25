@@ -1366,6 +1366,20 @@ def initialize_model_and_optimizer(
 
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
+
+    # Snapshot per-param-group max_lr right after construction (config_overrides
+    # in setup_model_and_optimizer placed the bias-predictor lr_mult correctly
+    # on the right group via Megatron's ParamKey(is_bias_predictor) filter).
+    # load_checkpoint + --override-opt_param-scheduler is observed to clobber
+    # max_lr across groups (job 313141: actor pg_0 came up at 2e-4 instead of
+    # 2e-6, blew up grad_norm to 49 in 2 steps). The Megatron distributed
+    # optimizer reshards bias_predictor params at construction and the
+    # is_bias_predictor attr is lost on the sharded versions, so the predictive
+    # group cannot be re-identified by attribute post-load. We snapshot the
+    # construction-time max_lrs and force-restore them after the optimizer
+    # state is loaded but before scheduler.step() reads them.
+    _construction_max_lrs = [pg.get("max_lr") for pg in optimizer.param_groups]
+
     clear_memory()
     iteration, _ = load_checkpoint(
         model,
@@ -1378,6 +1392,18 @@ def initialize_model_and_optimizer(
     clear_memory()
 
     check_model_hashes(args, model, iteration)
+
+    if len(optimizer.param_groups) == len(_construction_max_lrs):
+        for pg, expected_max_lr in zip(optimizer.param_groups, _construction_max_lrs, strict=True):
+            if expected_max_lr is None:
+                continue
+            if pg.get("max_lr") != expected_max_lr:
+                logger.info(
+                    "[Predictive Routing Replay] Restoring param-group max_lr: was=%s, expected=%s",
+                    pg.get("max_lr"),
+                    expected_max_lr,
+                )
+                pg["max_lr"] = expected_max_lr
 
     opt_param_scheduler.step(increment=iteration * args.global_batch_size)
 
