@@ -246,13 +246,29 @@ def _named_params_and_buffers_global(
             layer_idx, rest = match.groups()
             layer_idx = int(layer_idx) + layer_offset
 
-            # this is hardcoded for te grouped matmul
-            expert_pattern = r"mlp.experts\.(.+)\.weight(\d+)"
-            match = re.match(expert_pattern, rest)
-            if match:
-                rest, expert_idx = match.groups()
+            # Expert weights appear in two Megatron layouts and must yield the
+            # SAME canonical global name in both, otherwise the downstream EP
+            # broadcast (hf_weight_iterator_direct._get_megatron_full_params)
+            # and the HF converters desync across ranks:
+            #  - grouped GEMM (TEGroupedLinear): mlp.experts.linear_fcN.weight{idx}
+            #  - SequentialMLP (--moe-grouped-gemm off):
+            #      mlp.experts.local_experts.{local_idx}.linear_fcN.weight
+            # The grouped form already carries a GLOBAL expert index; the
+            # SequentialMLP form carries only a per-EP-rank LOCAL index, so
+            # every rank would emit identical local names (0..local_experts-1)
+            # and the per-expert broadcast would pick inconsistent src ranks.
+            # Rewrite the SequentialMLP form to the canonical grouped name with
+            # the global index = local_idx + expert_offset.
+            grouped_expert_match = re.match(r"mlp.experts\.(.+)\.weight(\d+)", rest)
+            seq_expert_match = re.match(r"mlp\.experts\.local_experts\.(\d+)\.(.+)\.weight", rest)
+            if grouped_expert_match:
+                sub, expert_idx = grouped_expert_match.groups()
                 expert_idx = int(expert_idx) + expert_offset
-                yield f"module.module.decoder.layers.{layer_idx}.mlp.experts.{rest}.weight{expert_idx}", param
+                yield f"module.module.decoder.layers.{layer_idx}.mlp.experts.{sub}.weight{expert_idx}", param
+            elif seq_expert_match:
+                local_idx, sub = seq_expert_match.groups()
+                expert_idx = int(local_idx) + expert_offset
+                yield f"module.module.decoder.layers.{layer_idx}.mlp.experts.{sub}.weight{expert_idx}", param
             else:
                 yield f"module.module.decoder.layers.{layer_idx}.{rest}", param
 
