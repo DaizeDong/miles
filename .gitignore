@@ -203,3 +203,4 @@ _examples_synced/
 .DS_Store
 .claude/
 scripts_mine/wandb_key_sandy.txt
+scripts_my_hpcfund/wandb_key_sandy.txt
