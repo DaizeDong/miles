@@ -191,6 +191,9 @@ def _cleanup_dump_dir(dump_dir: Path) -> None:
 
 def _get_phase_override_configs(args: Namespace, phase: DumperPhase) -> dict[str, Any]:
     raw = getattr(args, f"dumper_{phase.value}")
+    if DumperConfig is None:
+        # SIF sglang predates DumperConfig; treat all phases as disabled.
+        return {"enable": False}
     return {"enable": args.dumper_enable, **DumperConfig._kv_pairs_to_dict(raw)}
 
 
