@@ -61,7 +61,7 @@ export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-4096}"
 export SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.5}"
 
 # Rollout / optimizer
-export NUM_ROLLOUT="${NUM_ROLLOUT:-150}"           # full single-job run (paper target 270 needs multi-job resume)
+export NUM_ROLLOUT="${NUM_ROLLOUT:-10}"           # smoke on amd_pr2_on_main
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-32}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 export NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-2}"
