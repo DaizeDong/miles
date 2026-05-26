@@ -484,7 +484,6 @@ def forward_only(
         batch = get_batch(
             data_iterator,
             batch_keys,
-            parallel_state,
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
@@ -515,7 +514,6 @@ def forward_only(
         return output_tensor, partial(
             f,
             args=args,
-            parallel_state=parallel_state,
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
@@ -650,7 +648,6 @@ def train_one_step(
         batch = get_batch(
             data_iterator,
             batch_keys,
-            parallel_state,
             args.data_pad_size_multiplier,
             args.qkv_format,
             allgather_cp=args.allgather_cp,
@@ -708,7 +705,7 @@ def train_one_step(
             m.stage = old_stage
 
         return output_tensor, partial(
-            loss_function, args, parallel_state, batch, num_microbatches, apply_megatron_loss_scaling=True
+            loss_function, args, batch, num_microbatches, apply_megatron_loss_scaling=True
         )
 
     # Forward pass.
@@ -796,7 +793,7 @@ def train_one_step(
             saved_router_logits = True
 
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
-            loss_reduced = aggregate_train_losses(losses_reduced, parallel_state)
+            loss_reduced = aggregate_train_losses(losses_reduced)
             return loss_reduced, grad_norm
         return {}, grad_norm
     finally:

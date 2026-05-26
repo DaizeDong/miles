@@ -137,7 +137,7 @@ def get_batch(
         if sample_indices is None:
             sample_indices = list(range(len(tokens)))
         num_local_samples = len(data_iterator.rollout_data["total_lengths"])
-        dp_sample_offset = parallel_state.dp_rank * num_local_samples
+        dp_sample_offset = parallel_state.intra_dp.rank * num_local_samples
         rollout_max_seq_lens = data_iterator.rollout_data.get("max_seq_lens")
         if qkv_format == "bshd" and rollout_max_seq_lens is not None:
             seq_stride = rollout_max_seq_lens[0]
@@ -169,7 +169,7 @@ def get_batch(
         tokens = torch.stack(tokens)
         if global_token_ids is not None:
             global_token_ids = [
-                slice_with_cp(t, global_token_pad_id, parallel_state, qkv_format, max_seqlen)
+                slice_with_cp(t, global_token_pad_id, qkv_format, max_seqlen)
                 for t in global_token_ids
             ]
             global_token_ids = torch.stack(global_token_ids)
