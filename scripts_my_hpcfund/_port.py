@@ -468,6 +468,13 @@ def rewrite_text(path: Path, text: str) -> str:
             '  --save-interval "${SAVE_INTERVAL}"\n'
             '  --override-opt_param-scheduler\n', 1)
 
+    # 5o) Upstream radixark/main removed --prompt-truncation from the argparse
+    #     surface; the legacy launch ROLLOUT_ARGS still passes it
+    #     (`--prompt-truncation "${PROMPT_TRUNCATION}"`). train.py rejects
+    #     unrecognized args, so the run exits with code 2. Strip the line.
+    if is_sh and '  --prompt-truncation "${PROMPT_TRUNCATION}"\n' in text:
+        text = text.replace('  --prompt-truncation "${PROMPT_TRUNCATION}"\n', '')
+
     # 6) Commit 47f0319 ("downsize off2 PR² ablation grid from 8 to 2 nodes")
     #    intended to downsize the A0..A7 cells but the diff only renamed the
     #    files. The body still says --nodes=8 / ACTOR_NUM_NODES=4 /

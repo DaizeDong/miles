@@ -606,7 +606,6 @@ ROLLOUT_ARGS=(
   --input-key prompt
   --label-key label
   --apply-chat-template
-  --prompt-truncation "${PROMPT_TRUNCATION}"
   --rollout-shuffle
   --rm-type "${RM_TYPE}"
   --num-rollout "${NUM_ROLLOUT}"
