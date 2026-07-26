@@ -22,8 +22,18 @@ logger = logging.getLogger(__name__)
 def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     if (x := args.custom_eval_rollout_log_function_path) is not None:
         custom_log_func = load_function(x)
-        if custom_log_func(rollout_id, args, data, extra_metrics):
-            return
+        custom_metrics = custom_log_func(rollout_id, args, data, extra_metrics)
+        if isinstance(custom_metrics, dict):
+            return custom_metrics
+        # Preserve the documented legacy bool contract while allowing a dict
+        # to reach RolloutManager's metric checker.
+        if custom_metrics is True:
+            return {}
+        if custom_metrics is not None and custom_metrics is not False:
+            raise TypeError(
+                "custom eval rollout log function must return dict, bool, or None; "
+                f"got {type(custom_metrics).__name__}"
+            )
 
     log_dict = extra_metrics or {}
     for key in data.keys():

@@ -14,17 +14,48 @@
 
 set -euo pipefail
 
-readonly REPO=/home/daidong/rebuttal_workspace/miles-pr1362-validation-fixed
+: "${MILES_ROOT:?data preparation requires an explicit frozen MILES_ROOT}"
+: "${EXPECTED_CODE_SHA:?data preparation requires EXPECTED_CODE_SHA}"
+if [[ ! "${EXPECTED_CODE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "FATAL: EXPECTED_CODE_SHA must be a lowercase 40-character Git SHA" >&2
+  exit 97
+fi
+readonly REPO=$(realpath "${MILES_ROOT}")
+if [[ "${REPO}" != /home/daidong/* || ! -e "${REPO}/.git" ]]; then
+  echo "FATAL: MILES_ROOT must resolve to a Git worktree below /home/daidong: ${REPO}" >&2
+  exit 98
+fi
+readonly ACTUAL_CODE_SHA=$(git -c safe.directory="${REPO}" -C "${REPO}" rev-parse HEAD)
+if [[ "${ACTUAL_CODE_SHA}" != "${EXPECTED_CODE_SHA}" ]]; then
+  echo "FATAL: MILES_ROOT HEAD=${ACTUAL_CODE_SHA}, expected=${EXPECTED_CODE_SHA}" >&2
+  exit 99
+fi
+if [[ -n "$(git -c safe.directory="${REPO}" -C "${REPO}" status --porcelain --untracked-files=all)" ]]; then
+  echo "FATAL: MILES_ROOT must be clean: ${REPO}" >&2
+  exit 100
+fi
 readonly SCRIPT=${REPO}/experiments/pr2_rebuttal_amd/prepare_rebuttal_data.py
 readonly INNER_SCRIPT=${REPO}/experiments/pr2_rebuttal_amd/run_prepare_rebuttal_data.sh
 readonly IMAGE=docker.io/rlsys/miles@sha256:e60a69faa831ae2a146819290e8469cf23c81b97febeaf5d11e8baec2bfca285
 readonly OUTPUT_ROOT=${PR2_REBUTTAL_DATA_ROOT:-/home/daidong/rebuttal_workspace/data/pr2-rebuttal-one-copy-v1}
 readonly JOB_ID=${SPUR_JOB_ID:-${SLURM_JOB_ID:-}}
+readonly JOB_NODELIST=${SLURM_JOB_NODELIST:-${SPUR_JOB_NODELIST:-}}
 
 if [[ -z "${JOB_ID}" ]]; then
   echo "FATAL: this wrapper must run inside a SPUR/Slurm compute allocation" >&2
   exit 90
 fi
+if [[ -z "${JOB_NODELIST}" ]]; then
+  echo "FATAL: scheduler node metadata is missing; refusing login-node execution" >&2
+  exit 95
+fi
+case "${OUTPUT_ROOT}" in
+  /home/daidong/*) ;;
+  *)
+    echo "FATAL: output root must be below /home/daidong: ${OUTPUT_ROOT}" >&2
+    exit 96
+    ;;
+esac
 if [[ ! -f "${SCRIPT}" ]]; then
   echo "FATAL: data-preparation program not found: ${SCRIPT}" >&2
   exit 91
@@ -58,7 +89,7 @@ case "${PR2_REBUTTAL_DATA_MODE:-auto}" in
 esac
 
 echo "DATA_PREP_HOST_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "compute_host=$(hostname) job_id=${JOB_ID} output_root=${OUTPUT_ROOT} mode=${PR2_REBUTTAL_DATA_MODE:-auto}"
+echo "compute_host=$(hostname) job_id=${JOB_ID} output_root=${OUTPUT_ROOT} mode=${PR2_REBUTTAL_DATA_MODE:-auto} code_sha=${ACTUAL_CODE_SHA}"
 docker pull "${IMAGE}"
 docker image inspect "${IMAGE}" --format 'image_id={{.Id}} repo_digests={{json .RepoDigests}}'
 
@@ -73,6 +104,12 @@ docker run --rm \
   --env PYTHONUNBUFFERED=1 \
   --env PYTHONDONTWRITEBYTECODE=1 \
   --env MILES_CONTAINER_IMAGE="${IMAGE}" \
+  --env MILES_ROOT="${REPO}" \
+  --env EXPECTED_CODE_SHA="${EXPECTED_CODE_SHA}" \
+  --env SPUR_JOB_ID="${SPUR_JOB_ID:-}" \
+  --env SPUR_JOB_NODELIST="${SPUR_JOB_NODELIST:-}" \
+  --env SLURM_JOB_ID="${SLURM_JOB_ID:-}" \
+  --env SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST:-}" \
   "${IMAGE}" \
   /bin/bash "${INNER_SCRIPT}" "${OUTPUT_ROOT}" ${MODE_FLAG:+"${MODE_FLAG}"}
 

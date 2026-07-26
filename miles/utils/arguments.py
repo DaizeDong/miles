@@ -589,8 +589,9 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "The custom function for logging eval rollout data. "
-                    "def log_eval_rollout_data(rollout_id, args, data, extra_metrics) -> bool. "
-                    "The return value indicates whether to skip the default logging. "
+                    "def log_eval_rollout_data(rollout_id, args, data, extra_metrics) -> dict | bool | None. "
+                    "A metrics dict is returned to the metric checker and skips default logging; True skips "
+                    "default logging with an empty dict; False or None falls through to default logging. "
                 ),
             )
 

@@ -1,9 +1,44 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from tests.fast.ray.rollout.conftest import make_args, make_samples_grouped
 
+from miles.ray.rollout import metrics
 from miles.ray.rollout.metrics import _compute_metrics_from_samples, _compute_zero_std_metrics
+
+
+class TestCustomEvalMetricsContract:
+    @staticmethod
+    def _args():
+        return SimpleNamespace(
+            custom_eval_rollout_log_function_path="package.hook",
+            log_passrate=False,
+            n_samples_per_eval_prompt=1,
+        )
+
+    @pytest.mark.parametrize("value, expected", [({"custom": 1.0}, {"custom": 1.0}), (True, {})])
+    def test_dict_and_legacy_true_skip_default(self, monkeypatch, value, expected):
+        monkeypatch.setattr(metrics, "load_function", lambda _path: lambda *_args: value)
+        assert metrics.log_eval_rollout_data(1, self._args(), {}) == expected
+
+    def test_false_falls_through_to_default(self, monkeypatch):
+        monkeypatch.setattr(metrics, "load_function", lambda _path: lambda *_args: False)
+        monkeypatch.setattr(metrics, "compute_rollout_step", lambda _args, rollout_id: rollout_id)
+        monkeypatch.setattr(metrics.tracking_utils, "log", lambda *_args, **_kwargs: None)
+        result = metrics.log_eval_rollout_data(
+            3,
+            self._args(),
+            {"dataset": {"rewards": [0.0, 1.0]}},
+        )
+        assert result["eval/dataset"] == 0.5
+        assert result["eval/step"] == 3
+
+    def test_invalid_custom_return_type_fails(self, monkeypatch):
+        monkeypatch.setattr(metrics, "load_function", lambda _path: lambda *_args: "invalid")
+        with pytest.raises(TypeError, match="dict, bool, or None"):
+            metrics.log_eval_rollout_data(1, self._args(), {})
 
 
 class TestComputeZeroStdMetrics:

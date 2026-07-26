@@ -1,15 +1,12 @@
-# Direct verifier dependencies, pinned to the versions in IFBench's uv.lock at
-# commit 1091c4c3de6c1f6ed12c012ed68f11ea450b0117.  Transitive versions and
-# exact wheel hashes are frozen in the generated data bundle.
-absl-py==2.3.1
-emoji==2.15.0
-httpx==0.28.1
-immutabledict==4.2.2
-langdetect==1.0.9
-nltk==3.9.2
-pydantic==2.12.5
-pydantic-settings==2.12.0
-setuptools==80.9.0
-syllapy==0.7.2
-tqdm==4.67.1
-unicodedata2==17.0.0
+# Verifier-only packages absent from the immutable Miles image, pinned to the
+# IFBench at commit 1091c4c3de6c1f6ed12c012ed68f11ea450b0117 declares
+# these dependencies without upper bounds. Open Instruct at commit
+# 5b2ebfa12381925bb431845d588dbc9ebead20a7 declares nltk>=3.9.1.
+# NLTK 3.9.4 is the current compatible security/bug-fix release for Python
+# >=3.10. Hashes below are the selected artifacts published by official PyPI.
+# Download and install MUST use both --no-deps and --require-hashes.
+emoji==2.15.0 --hash=sha256:205296793d66a89d88af4688fa57fd6496732eb48917a87175a023c8138995eb
+immutabledict==4.2.2 --hash=sha256:97c31d098a2c850e93a958badeef765e4736ed7942ec73e439facd764a3a7217
+langdetect==1.0.9 --hash=sha256:cbc1fef89f8d062739774bd51eda3da3274006b3661d199c2655f6b3f6d605a0
+nltk==3.9.4 --hash=sha256:f2fa301c3a12718ce4a0e9305c5675299da5ad9e26068218b69d692fda84828f
+syllapy==0.7.2 --hash=sha256:198a7413033c32d7b31e21962efb3f284bcea80d3346e954b938ca1ebe6bee20
