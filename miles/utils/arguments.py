@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -19,6 +20,7 @@ from miles.utils.misc import load_function
 logger = logging.getLogger(__name__)
 
 PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES = ("kl", "kl-post")
+PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES = ("linear", "mlp")
 PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES = ("fp32", "bf16", "fp16")
 PREDICTIVE_ROUTING_REPLAY_LAYER_SCALE_SCHEDULES = ("none", "linear_decay", "sqrt_decay", "cosine_decay")
 
@@ -44,7 +46,29 @@ def _validate_predictive_routing_replay_args(args):
     args.enable_bias_predictor = predictive_enabled
     args.predictive_routing_replay_mode = "R2" if predictive_enabled else None
 
+    predictor_architecture = getattr(args, "bias_predictor_architecture", "linear")
+    predictor_hidden_size = int(getattr(args, "bias_predictor_hidden_size", 64))
+    route_noise_std = float(getattr(args, "predictive_route_noise_std", 0.0))
+    route_noise_seed = int(getattr(args, "predictive_route_noise_seed", 42))
+
+    if predictor_architecture not in PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES:
+        raise AssertionError(
+            f"Unsupported bias predictor architecture: {predictor_architecture}. "
+            f"Expected one of {PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES}."
+        )
+    if predictor_hidden_size <= 0:
+        raise AssertionError("--bias-predictor-hidden-size must be greater than 0.")
+    if not math.isfinite(route_noise_std) or route_noise_std < 0:
+        raise AssertionError("--predictive-route-noise-std must be finite and greater than or equal to 0.")
+    if route_noise_seed < 0:
+        raise AssertionError("--predictive-route-noise-seed must be greater than or equal to 0.")
+
     if not predictive_enabled:
+        if route_noise_std != 0:
+            raise AssertionError(
+                "--predictive-route-noise-std requires --enable-predictive-routing-replay because the "
+                "intervention is defined on PR2's predicted RECORD route."
+            )
         return
 
     if getattr(args, "train_backend", None) != "megatron":
@@ -53,7 +77,7 @@ def _validate_predictive_routing_replay_args(args):
     if getattr(args, "use_rollout_routing_replay", False):
         raise AssertionError(
             "--enable-predictive-routing-replay and --use-rollout-routing-replay are mutually "
-            "exclusive: PR² already produces its own predicted top-k for replay on the actor side, "
+            "exclusive: PR² already produces its own predicted top-k for actor-side R2 replay, "
             "and combining it with rollout-side routing replay would double-replay the routing."
         )
 
@@ -1171,6 +1195,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="The rollout routing replay technique from https://arxiv.org/abs/2510.11370",
             )
+            # These existing indexer-replay flags were accidentally dropped
+            # when the routing options were regrouped for the PR2 CLI.
+            pr2_group.add_argument(
+                "--use-indexer-replay",
+                action="store_true",
+                default=False,
+                help="Replay indexer top-k decisions for layers with indexers.",
+            )
+            pr2_group.add_argument(
+                "--use-rollout-indexer-replay",
+                action="store_true",
+                default=False,
+                help="Replay indexer top-k decisions returned by rollout during training.",
+            )
             pr2_group.add_argument(
                 "--enable-predictive-routing-replay",
                 action="store_true",
@@ -1185,10 +1223,50 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Loss used to train the predictive router bias predictor. 'kl-post' (default) is the paper's main PR² objective: D_KL(softmax(current_logits).detach() || softmax(old_logits + predicted_delta)). 'kl' is a Miles-experimental delta-distribution variant (not in paper).",
             )
             pr2_group.add_argument(
+                "--bias-predictor-architecture",
+                type=str,
+                default="linear",
+                choices=PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES,
+                help=(
+                    "Predictor architecture. 'linear' is the paper/default d->N head and preserves "
+                    "existing checkpoint keys. 'mlp' is the rebuttal ablation d->H->N head with SiLU, "
+                    "no biases, and a zero-initialized output layer."
+                ),
+            )
+            pr2_group.add_argument(
+                "--bias-predictor-hidden-size",
+                type=int,
+                default=64,
+                help=(
+                    "Hidden width H for --bias-predictor-architecture=mlp. The Moonlight ablation uses "
+                    "H=64 (135,168 parameters/layer versus 131,072 for the linear head)."
+                ),
+            )
+            pr2_group.add_argument(
                 "--bias-predictor-lr-mult",
                 type=float,
                 default=1000.0,
                 help="Multiplier alpha applied to the bias-predictor parameter group's learning rate: predictor_lr = base_lr * alpha. Paper Appendix E.1 sweeps alpha in {5e1, 1e2, 1e3, 1e4} across models; default 1e3 matches Qwen3 off-{4,8} and OLMoE.",
+            )
+            pr2_group.add_argument(
+                "--predictive-route-noise-std",
+                type=float,
+                default=0.0,
+                help=(
+                    "Experimental degraded-route intervention. During PR2 RECORD only, add deterministic "
+                    "Gaussian noise with scale sigma * median_token(std_expert(old_logits + predicted_delta)) "
+                    "before selecting/caching hard top-k support. The predictor loss, teacher logits, selected "
+                    "expert scores, and predictor optimizer remain clean. Default 0 disables the intervention."
+                ),
+            )
+            pr2_group.add_argument(
+                "--predictive-route-noise-seed",
+                type=int,
+                default=42,
+                help=(
+                    "Base seed for the deterministic RECORD-only route-noise field. Seeds are mixed with the "
+                    "record round, DP rank, router layer, and local router-call index."
+                ),
             )
             pr2_group.add_argument(
                 "--predictive-downsample-batch-size",

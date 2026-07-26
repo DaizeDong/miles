@@ -7,9 +7,9 @@ Holds:
     ``DISABLED``), and the recorded predictive microbatch queue.
   * The ``TopKRouter.forward`` patch installed by
     ``apply_predictive_router_replay_patch``.
-  * ``initialize_predictive_router_modules`` — builds the per-layer
-    ``bias_predictor = nn.Linear(hidden, num_experts, bias=False)`` head
-    with zero-initialized weights (paper §4.1) and registers state.
+  * ``initialize_predictive_router_modules`` — builds the per-layer paper
+    ``nn.Linear(hidden, num_experts, bias=False)`` head, or the opt-in
+    parameter-matched two-layer rebuttal ablation, and registers state.
 
 The stateless helpers (stabilization layer, loss / sample reweighting,
 synthetic-loss sync) live in
@@ -17,6 +17,8 @@ synthetic-loss sync) live in
 and are re-exported here so existing callers can keep importing from
 this module.
 """
+import hashlib
+import inspect
 import logging
 import os
 from contextlib import contextmanager
@@ -112,7 +114,23 @@ def _iter_module_chunks(model_chunks):
         yield getattr(model_chunk, "module", model_chunk)
 
 
-def _build_bias_predictor(router) -> nn.Linear:
+def _mark_bias_predictor_parameters(bias_predictor: nn.Module) -> None:
+    """Mark every predictor tensor for Megatron's dedicated optimizer group."""
+    for param in bias_predictor.parameters():
+        setattr(param, "is_bias_predictor", True)
+        setattr(param, "allreduce", True)
+        setattr(param, "sequence_parallel", False)
+        setattr(param, "tensor_model_parallel", False)
+        setattr(param, "partition_dim", 0)
+        setattr(param, "partition_stride", 1)
+
+
+def _build_bias_predictor(
+    router,
+    *,
+    architecture: str = "linear",
+    hidden_size: int = 64,
+) -> nn.Module:
     gating_weight = getattr(router.gating, "weight", None)
     if gating_weight is not None:
         in_features = gating_weight.shape[1]
@@ -125,20 +143,90 @@ def _build_bias_predictor(router) -> nn.Linear:
         device = None
         dtype = None
 
-    bias_predictor = nn.Linear(in_features=in_features, out_features=out_features, bias=False)
-    nn.init.zeros_(bias_predictor.weight)
+    if architecture == "linear":
+        # Keep this as a bare Linear module so existing checkpoints retain the
+        # exact ``bias_predictor.weight`` key.
+        bias_predictor: nn.Module = nn.Linear(in_features=in_features, out_features=out_features, bias=False)
+        nn.init.zeros_(bias_predictor.weight)
+    elif architecture == "mlp":
+        if hidden_size <= 0:
+            raise ValueError(f"bias predictor hidden_size must be positive, got {hidden_size}")
+        output_layer = nn.Linear(in_features=hidden_size, out_features=out_features, bias=False)
+        # A zero output layer gives exact initial route parity with the base
+        # router while leaving the input projection conventionally initialized.
+        nn.init.zeros_(output_layer.weight)
+        bias_predictor = nn.Sequential(
+            nn.Linear(in_features=in_features, out_features=hidden_size, bias=False),
+            nn.SiLU(),
+            output_layer,
+        )
+    else:
+        raise ValueError(f"Unsupported bias predictor architecture: {architecture!r}")
+
     if device is not None or dtype is not None:
         bias_predictor = bias_predictor.to(device=device, dtype=dtype)
 
-    for param in bias_predictor.parameters():
-        setattr(param, "is_bias_predictor", True)
-        setattr(param, "allreduce", True)
-        setattr(param, "sequence_parallel", False)
-        setattr(param, "tensor_model_parallel", False)
-        setattr(param, "partition_dim", 0)
-        setattr(param, "partition_stride", 1)
+    _mark_bias_predictor_parameters(bias_predictor)
 
     return bias_predictor
+
+
+def apply_predictive_route_noise(
+    *,
+    effective_logits: torch.Tensor,
+    noise_std: float,
+    noise_seed: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Apply the rebuttal's deterministic, RECORD-only hard-route intervention.
+
+    The caller uses the returned logits only for hard top-k selection. The
+    clean predictor delta remains the input to predictive supervision and the
+    selected-expert score calculation in later replay passes.
+    """
+    if noise_std < 0:
+        raise ValueError(f"predictive route noise_std must be non-negative, got {noise_std}")
+    if noise_std == 0:
+        return effective_logits, {
+            "predictive_route_noise_scale": 0.0,
+            "predictive_route_noise_abs_mean": 0.0,
+        }
+
+    detached_logits = effective_logits.detach().float()
+    per_token_scale = detached_logits.std(dim=-1, unbiased=False)
+    route_scale = per_token_scale.median()
+
+    generator = torch.Generator(device=effective_logits.device)
+    generator.manual_seed(int(noise_seed))
+    standard_noise = torch.randn(
+        effective_logits.shape,
+        dtype=torch.float32,
+        device=effective_logits.device,
+        generator=generator,
+    )
+    scaled_noise = standard_noise * (float(noise_std) * route_scale)
+    noisy_logits = effective_logits + scaled_noise.to(dtype=effective_logits.dtype)
+    return noisy_logits, {
+        "predictive_route_noise_scale": float((float(noise_std) * route_scale).item()),
+        "predictive_route_noise_abs_mean": float(scaled_noise.abs().mean().item()),
+    }
+
+
+def calculate_routing_map_topk_accuracy(
+    *,
+    routing_map: torch.Tensor,
+    current_logits: torch.Tensor,
+    topk: int,
+) -> float:
+    """Return slot overlap between the executed replay map and current top-k."""
+    current_logits = current_logits.reshape(-1, current_logits.shape[-1])
+    routing_map = routing_map.reshape(-1, routing_map.shape[-1]).bool()
+    if routing_map.shape != current_logits.shape:
+        raise ValueError(
+            f"routing-map/current-logit shape mismatch: routing_map={routing_map.shape}, "
+            f"current_logits={current_logits.shape}"
+        )
+    current_topk = torch.topk(current_logits, k=topk, dim=-1).indices
+    return routing_map.gather(1, current_topk).float().mean().item()
 
 
 def initialize_predictive_router_modules(
@@ -147,6 +235,10 @@ def initialize_predictive_router_modules(
     enabled: bool,
     loss_type: str,
     lr_mult: float,
+    architecture: str = "linear",
+    hidden_size: int = 64,
+    route_noise_std: float = 0.0,
+    route_noise_seed: int = 42,
     layer_scale_schedule: str = "none",
     layer_scale_min: float = 1.0,
     boundary_loss_max_weight: float | None = None,
@@ -168,6 +260,10 @@ def initialize_predictive_router_modules(
             submodule.config.enable_router_bias_predictor = enabled
             submodule.config.bias_predictor_loss_type = loss_type
             submodule.config.bias_predictor_lr_mult = lr_mult
+            submodule.config.bias_predictor_architecture = architecture
+            submodule.config.bias_predictor_hidden_size = hidden_size
+            submodule.config.predictive_route_noise_std = route_noise_std
+            submodule.config.predictive_route_noise_seed = route_noise_seed
             submodule.config.predictive_layer_scale_schedule = layer_scale_schedule
             submodule.config.predictive_layer_scale_min = layer_scale_min
             submodule.config.predictive_boundary_loss_max_weight = boundary_loss_max_weight
@@ -180,7 +276,11 @@ def initialize_predictive_router_modules(
                 continue
 
             PredictiveRouterReplayState.register_router(submodule)
-            submodule.bias_predictor = _build_bias_predictor(submodule)
+            submodule.bias_predictor = _build_bias_predictor(
+                submodule,
+                architecture=architecture,
+                hidden_size=hidden_size,
+            )
 
 
 def predictive_debug_param_stats_enabled() -> bool:
@@ -257,20 +357,105 @@ def apply_predictive_router_replay_patch() -> None:
         return
 
     original_forward = TopKRouter.forward
+    routing = TopKRouter.routing
 
-    def patched_forward(self, input: torch.Tensor):
+    def _supported_context_names(method):
+        parameters = inspect.signature(method).parameters
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+        supported = set()
+        if accepts_kwargs or "padding_mask" in parameters:
+            supported.add("padding_mask")
+        if accepts_kwargs or "input_ids" in parameters:
+            supported.add("input_ids")
+        return supported
+
+    original_forward_context = _supported_context_names(original_forward)
+    routing_context = _supported_context_names(routing)
+
+    def _context_kwargs(supported, *, padding_mask, input_ids):
+        context = {}
+        if "padding_mask" in supported:
+            context["padding_mask"] = padding_mask
+        if "input_ids" in supported:
+            context["input_ids"] = input_ids
+        return context
+
+    def _call_original_forward(self, input, padding_mask, input_ids):
+        return original_forward(
+            self,
+            input,
+            **_context_kwargs(
+                original_forward_context,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+            ),
+        )
+
+    def _call_routing(self, logits, padding_mask, input_ids):
+        return routing(
+            self,
+            logits,
+            **_context_kwargs(
+                routing_context,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+            ),
+        )
+
+    def _record_noisy_support_with_clean_scores(self, clean_logits, noisy_logits, padding_mask, input_ids):
+        """Record support from ``noisy_logits`` but return clean-score routing.
+
+        The first routing call appends the intervention's hard indices. The
+        second temporarily replays only that newest entry against clean PR2
+        logits, then restores the forward cursor so the real training forward
+        can consume the cache normally.
+        """
+        replay = getattr(self, "routing_replay", None)
+        manager = routing_replay_manager
+        if replay is None or not manager.enabled or manager.stage != "record":
+            raise RuntimeError(
+                "Predictive route noise requires an enabled actor-side routing replay in RECORD stage."
+            )
+
+        original_stage = manager.stage
+        original_forward_index = replay.forward_index
+        original_logits_recording = manager.enable_logits_recording
+        try:
+            # Do not write the perturbed logits into the clean routing artifact.
+            manager.enable_logits_recording = False
+            _call_routing(self, noisy_logits, padding_mask, input_ids)
+            if not replay.top_indices_list:
+                raise RuntimeError("Predictive route noise did not record a hard support.")
+
+            manager.stage = "replay_forward"
+            replay.forward_index = len(replay.top_indices_list) - 1
+            manager.enable_logits_recording = original_logits_recording
+            return _call_routing(self, clean_logits, padding_mask, input_ids)
+        finally:
+            manager.stage = original_stage
+            replay.forward_index = original_forward_index
+            manager.enable_logits_recording = original_logits_recording
+
+    def patched_forward(
+        self,
+        input: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+    ):
         predictive_state = getattr(self, "predictive_router_replay", None)
         bias_predictor = getattr(self, "bias_predictor", None)
         predictive_controller = get_predictive_replay_controller()
 
         if predictive_state is None or bias_predictor is None:
-            return original_forward(self, input)
+            return _call_original_forward(self, input, padding_mask, input_ids)
 
         _ensure_bias_predictor_runtime_placement(bias_predictor=bias_predictor, reference_tensor=input)
 
         predictive_action = predictive_state.predictive_action
         if predictive_action in {None, RouterPredictiveAction.DISABLED, RouterPredictiveAction.SKIP_PREDICTIVE}:
-            return original_forward(self, input)
+            return _call_original_forward(self, input, padding_mask, input_ids)
 
         self._maintain_float32_expert_bias()
         input = self.apply_input_jitter(input)
@@ -293,6 +478,30 @@ def apply_predictive_router_replay_patch() -> None:
                 )
                 effective_logits = logits + predicted_delta_logits
                 applied_delta_logits = predicted_delta_logits
+                route_noise_std = float(getattr(self.config, "predictive_route_noise_std", 0.0))
+                routing_logits = effective_logits
+                if route_noise_std > 0:
+                    route_noise_seed = predictive_controller.next_record_noise_seed(
+                        base_seed=int(getattr(self.config, "predictive_route_noise_seed", 42)),
+                        layer_idx=predictive_state.layer_idx,
+                    )
+                    routing_logits, route_noise_metrics = apply_predictive_route_noise(
+                        effective_logits=effective_logits,
+                        noise_std=route_noise_std,
+                        noise_seed=route_noise_seed,
+                    )
+                    route_noise_metrics["predictive_route_noise_clean_overlap"] = calculate_topk_accuracy(
+                        topk=self.topk,
+                        logits1=effective_logits,
+                        logits2=routing_logits,
+                    )
+                    for metric_name, metric_value in route_noise_metrics.items():
+                        PredictiveRouterReplayState.record_predictive_scalar_metric(
+                            metric_name,
+                            predictive_state.layer_idx,
+                            metric_value,
+                            effective_logits.numel() // effective_logits.shape[-1],
+                        )
                 PredictiveRouterReplayState.record_predictive_bias_stats(
                     predictive_state.layer_idx,
                     applied_delta_logits,
@@ -302,11 +511,24 @@ def apply_predictive_router_replay_patch() -> None:
                     applied_delta_logits,
                     predictive_state.layer_idx,
                 )
-            return self.routing(effective_logits)
+            if route_noise_std > 0:
+                return _record_noisy_support_with_clean_scores(
+                    self,
+                    effective_logits,
+                    routing_logits,
+                    padding_mask,
+                    input_ids,
+                )
+            return _call_routing(self, effective_logits, padding_mask, input_ids)
 
         if predictive_action != RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS:
             raise ValueError(f"Unsupported predictive router action: {predictive_action}")
 
+        # In replay mode this returns the support cached during RECORD. Keep the
+        # resulting map so degraded-route runs can measure their executed
+        # support against the current router, independently of clean predictor
+        # agreement.
+        probs, routing_map = _call_routing(self, logits, padding_mask, input_ids)
         old_inputs, old_logits, valid_mask, predictive_loss_scale = predictive_state.get_predictive_data()
         if predictive_state.has_valid_predictive_data():
             old_inputs = old_inputs.to(
@@ -321,10 +543,12 @@ def apply_predictive_router_replay_patch() -> None:
             )
             current_inputs = input
             current_logits = logits
+            routing_map_for_metrics = routing_map.reshape(-1, routing_map.shape[-1])
             if valid_mask is not None:
                 valid_mask = valid_mask.to(device=input.device, non_blocking=valid_mask.device.type == "cpu")
                 current_inputs = input[valid_mask]
                 current_logits = logits[valid_mask]
+                routing_map_for_metrics = routing_map_for_metrics[valid_mask.reshape(-1)]
             current_inputs = current_inputs.detach()
             old_logits = old_logits.detach()
             current_logits = current_logits.detach()
@@ -369,6 +593,16 @@ def apply_predictive_router_replay_patch() -> None:
                 ),
                 current_logits.shape[0],
             )
+            PredictiveRouterReplayState.record_predictive_scalar_metric(
+                "predictive_executed_topk_accuracy",
+                predictive_state.layer_idx,
+                calculate_routing_map_topk_accuracy(
+                    routing_map=routing_map_for_metrics,
+                    current_logits=current_logits,
+                    topk=self.topk,
+                ),
+                current_logits.shape[0],
+            )
             for metric_name, metric_value in stabilizer_metrics.items():
                 PredictiveRouterReplayState.record_predictive_scalar_metric(
                     metric_name,
@@ -395,7 +629,6 @@ def apply_predictive_router_replay_patch() -> None:
             with torch.enable_grad():
                 predictive_loss = build_synthetic_predictive_loss(bias_predictor=bias_predictor, input_tensor=input)
 
-        probs, routing_map = self.routing(logits)
         predictive_loss.backward()
         predictive_state.clear_predictive_data()
         return probs, routing_map
@@ -405,12 +638,28 @@ def apply_predictive_router_replay_patch() -> None:
 
 
 @contextmanager
-def predictive_action_scope(action: RouterPredictiveAction):
-    get_predictive_replay_controller().set_global_predictive_action(action)
+def predictive_action_scope(
+    action: RouterPredictiveAction,
+    *,
+    rollout_id: int | None = None,
+    step_id: int | None = None,
+):
+    controller = get_predictive_replay_controller()
+    previous_rollout_id = controller.current_rollout_id
+    previous_step_id = controller.current_step_id
+    if rollout_id is not None or step_id is not None:
+        controller.set_current_step_context(rollout_id=rollout_id, step_id=step_id)
+    if action == RouterPredictiveAction.RECORD:
+        controller.begin_recording_round()
+    controller.set_global_predictive_action(action)
     try:
         yield
     finally:
-        get_predictive_replay_controller().clear_global_predictive_action()
+        controller.clear_global_predictive_action()
+        controller.set_current_step_context(
+            rollout_id=previous_rollout_id,
+            step_id=previous_step_id,
+        )
 
 
 def _is_predictive_param_group(param_group: dict) -> bool:
@@ -494,6 +743,8 @@ class PredictiveReplayController:
         self.current_action = RouterPredictiveAction.DISABLED
         self.current_rollout_id: int | None = None
         self.current_step_id: int | None = None
+        self.record_round = -1
+        self.record_noise_call_counts: dict[int, int] = {}
         self.microbatches: list[object] = []
         self.train_index = 0
         self.used_valid_predictive_data = False
@@ -513,6 +764,37 @@ class PredictiveReplayController:
         self.current_rollout_id = None
         self.current_step_id = None
 
+    def begin_recording_round(self) -> None:
+        """Start one deterministic RECORD round and reset per-layer call order."""
+        self.record_round += 1
+        self.record_noise_call_counts.clear()
+
+    @staticmethod
+    def _get_data_parallel_rank() -> int:
+        if not dist.is_initialized():
+            return 0
+        try:
+            from megatron.core import parallel_state as mpu
+
+            return int(mpu.get_data_parallel_rank(with_context_parallel=False))
+        except Exception:
+            return int(dist.get_rank())
+
+    def next_record_noise_seed(self, *, base_seed: int, layer_idx: int) -> int:
+        """Derive a stable seed without relying on Python's salted ``hash``."""
+        call_index = self.record_noise_call_counts.get(layer_idx, 0)
+        self.record_noise_call_counts[layer_idx] = call_index + 1
+        if self.current_rollout_id is None:
+            round_key = f"record:{self.record_round}"
+        else:
+            round_key = f"rollout:{self.current_rollout_id}"
+        payload = (
+            f"{int(base_seed)}:{round_key}:{self._get_data_parallel_rank()}:"
+            f"{int(layer_idx)}:{call_index}"
+        ).encode("ascii")
+        digest = hashlib.blake2b(payload, digest_size=8, person=b"miles-pr2").digest()
+        return int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1)
+
     def get_current_rollout_id(self) -> int | None:
         return self.current_rollout_id
 
@@ -531,6 +813,8 @@ class PredictiveReplayController:
         self.disable_predictive_metric_tensor_capture()
         self.clear_predictive_metric_tensors()
         self.clear_current_step_context()
+        self.record_round = -1
+        self.record_noise_call_counts.clear()
 
     def add_router_state(self, state: "PredictiveRouterReplayState") -> None:
         self.router_states.append(state)
@@ -1046,5 +1330,3 @@ class PredictiveRouterReplayState:
     @classmethod
     def get_and_clear_predictive_metrics(cls) -> dict[str, float]:
         return get_predictive_replay_controller().get_and_clear_predictive_metrics()
-
-

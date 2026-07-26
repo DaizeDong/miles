@@ -7,7 +7,10 @@ import logging
 import os
 from typing import Any
 
-from sglang.srt.entrypoints.openai import encoding_dsv4
+try:
+    from sglang.srt.entrypoints.openai import encoding_dsv4
+except ImportError:  # Older SGLang in the official ROCm image
+    encoding_dsv4 = None
 from sglang.srt.entrypoints.openai.protocol import Tool
 
 logger = logging.getLogger(__name__)
@@ -88,6 +91,8 @@ def render_messages(messages: list[dict[str, Any]], *, tools: list[dict] | None 
     Tool_call ``arguments`` must already be JSON strings; *tools*, if given, are
     injected into the system message (see ``_inject_tools_into_system``).
     """
+    if encoding_dsv4 is None:
+        raise RuntimeError("This SGLang build does not provide the DeepSeek-V4 encoder")
     encode_config = _build_deepseek_encode_config(kwargs)
     if tools:
         messages = _inject_tools_into_system(messages, tools)

@@ -58,6 +58,18 @@ async def async_rm(args, sample: Sample, **kwargs):
         from .ifbench import compute_ifbench_reward
 
         return compute_ifbench_reward(response, label, metadata=metadata)
+    elif rm_type == "ifbench_per_constraint":
+        from .ifbench import compute_ifbench_reward
+
+        return compute_ifbench_reward(response, label, metadata=metadata, aggregation="per_constraint_mean")
+    elif rm_type == "ifeval_old":
+        from .ifbench import compute_ifeval_old_reward
+
+        return compute_ifeval_old_reward(response, label, metadata=metadata)
+    elif rm_type == "ifevalg":
+        from .ifbench import compute_ifevalg_reward
+
+        return compute_ifevalg_reward(response, label, metadata=metadata)
     elif rm_type == "random":
         return random.randint(0, 1)
     elif rm_type:

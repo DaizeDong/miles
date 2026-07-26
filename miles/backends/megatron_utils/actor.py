@@ -62,6 +62,12 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+
+def _pr2_validate_enabled() -> bool:
+    """Return whether the opt-in PR2 end-to-end validation checks are enabled."""
+    return os.environ.get("PR2_VALIDATE", "0") == "1"
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -305,7 +311,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with timer(f"{store_prefix}log_probs"):
             predictive_context = (
-                predictive_action_scope(RouterPredictiveAction.RECORD) if enable_predictive_record else nullcontext()
+                predictive_action_scope(
+                    RouterPredictiveAction.RECORD,
+                    rollout_id=global_step,
+                )
+                if enable_predictive_record
+                else nullcontext()
             )
             with predictive_context:
                 should_save_router_logits = (
@@ -394,6 +405,8 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         predictive_enabled = getattr(self.args, "enable_predictive_routing_replay", False)
         predictive_controller = get_predictive_replay_controller()
+        pr2_validate = predictive_enabled and _pr2_validate_enabled()
+        expected_predictive_microbatches = sum(num_microbatches) if pr2_validate else None
         if predictive_enabled and not self.args.compute_advantages_and_returns:
             raise RuntimeError(
                 "Predictive routing replay requires compute_advantages_and_returns in Miles so old actor logprobs "
@@ -473,6 +486,73 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
                     if predictive_enabled:
+                        if pr2_validate:
+                            assert expected_predictive_microbatches is not None
+                            buffered = predictive_controller.buffered_microbatch_count()
+                            predictive_microbatches = predictive_controller.microbatches
+                            valid_microbatches = sum(
+                                int(bool(getattr(microbatch, "has_valid_samples", False)))
+                                for microbatch in predictive_microbatches
+                            )
+                            selected_tokens = sum(
+                                int(getattr(microbatch, "selected_total_tokens", 0))
+                                for microbatch in predictive_microbatches
+                            )
+                            original_tokens = sum(
+                                int(getattr(microbatch, "original_total_tokens", 0))
+                                for microbatch in predictive_microbatches
+                            )
+                            if is_megatron_main_rank():
+                                logger.info(
+                                    "[PR2_VALIDATE] feature_cache_recorded rollout=%s buffered=%s expected=%s "
+                                    "valid_microbatches=%s selected_tokens=%s original_tokens=%s",
+                                    rollout_id,
+                                    buffered,
+                                    expected_predictive_microbatches,
+                                    valid_microbatches,
+                                    selected_tokens,
+                                    original_tokens,
+                                )
+                            if buffered != expected_predictive_microbatches:
+                                raise RuntimeError(
+                                    "[PR2_VALIDATE] Predictive feature cache record count mismatch: "
+                                    f"rollout={rollout_id}, buffered={buffered}, "
+                                    f"expected={expected_predictive_microbatches}"
+                                )
+
+                            for replay_manager in all_replay_managers:
+                                if not replay_manager.enabled:
+                                    continue
+                                recorded_counts = [len(replay.top_indices_list) for replay in replay_manager.replays]
+                                record_full = bool(recorded_counts) and all(
+                                    count == expected_predictive_microbatches for count in recorded_counts
+                                )
+                                if is_megatron_main_rank():
+                                    logger.info(
+                                        "[PR2_VALIDATE] topk_cache_recorded rollout=%s manager=%s layers=%s "
+                                        "recorded_min=%s recorded_max=%s expected_per_layer=%s full=%s",
+                                        rollout_id,
+                                        replay_manager.name,
+                                        len(recorded_counts),
+                                        min(recorded_counts, default=0),
+                                        max(recorded_counts, default=0),
+                                        expected_predictive_microbatches,
+                                        record_full,
+                                    )
+                                if not record_full:
+                                    mismatches = [
+                                        (replay.layer_idx, count)
+                                        for replay, count in zip(
+                                            replay_manager.replays, recorded_counts, strict=True
+                                        )
+                                        if count != expected_predictive_microbatches
+                                    ]
+                                    raise RuntimeError(
+                                        "[PR2_VALIDATE] Top-k cache record count mismatch: "
+                                        f"rollout={rollout_id}, manager={replay_manager.name}, "
+                                        f"expected_per_layer={expected_predictive_microbatches}, "
+                                        f"mismatches={mismatches}"
+                                    )
                         predictive_controller.reset_microbatch_cursor()
                     for m in all_replay_managers:
                         if self._use_rollout_replay(m):
@@ -515,11 +595,79 @@ class MegatronTrainRayActor(TrainRayActor):
                     self.parallel_state,
                     router_logits_saver=self.logits_saver if should_save_router_logits else None,
                 )
-                if predictive_enabled and predictive_controller.remaining_microbatch_count() != 0:
-                    raise RuntimeError(
-                        "Predictive routing replay buffer was not fully consumed during actor training: "
-                        f"remaining={predictive_controller.remaining_microbatch_count()}"
-                    )
+                if predictive_enabled:
+                    remaining = predictive_controller.remaining_microbatch_count()
+                    if pr2_validate:
+                        assert expected_predictive_microbatches is not None
+                        buffered = predictive_controller.buffered_microbatch_count()
+                        consumed = buffered - remaining
+                        if is_megatron_main_rank():
+                            logger.info(
+                                "[PR2_VALIDATE] feature_cache_consumed rollout=%s buffered=%s consumed=%s "
+                                "remaining=%s expected=%s full=%s",
+                                rollout_id,
+                                buffered,
+                                consumed,
+                                remaining,
+                                expected_predictive_microbatches,
+                                buffered == expected_predictive_microbatches and remaining == 0,
+                            )
+
+                        for replay_manager in all_replay_managers:
+                            if not replay_manager.enabled:
+                                continue
+                            recorded_counts = [len(replay.top_indices_list) for replay in replay_manager.replays]
+                            forward_counts = [replay.forward_index for replay in replay_manager.replays]
+                            backward_counts = [replay.backward_index for replay in replay_manager.replays]
+                            cursors_full = bool(recorded_counts) and all(
+                                recorded == forward == backward
+                                for recorded, forward, backward in zip(
+                                    recorded_counts,
+                                    forward_counts,
+                                    backward_counts,
+                                    strict=True,
+                                )
+                            )
+                            if is_megatron_main_rank():
+                                logger.info(
+                                    "[PR2_VALIDATE] topk_cache_consumed rollout=%s manager=%s layers=%s "
+                                    "recorded_min=%s recorded_max=%s forward_min=%s forward_max=%s "
+                                    "backward_min=%s backward_max=%s full=%s",
+                                    rollout_id,
+                                    replay_manager.name,
+                                    len(recorded_counts),
+                                    min(recorded_counts, default=0),
+                                    max(recorded_counts, default=0),
+                                    min(forward_counts, default=0),
+                                    max(forward_counts, default=0),
+                                    min(backward_counts, default=0),
+                                    max(backward_counts, default=0),
+                                    cursors_full,
+                                )
+                            if not cursors_full:
+                                mismatches = [
+                                    (replay.layer_idx, recorded, forward, backward)
+                                    for replay, recorded, forward, backward in zip(
+                                        replay_manager.replays,
+                                        recorded_counts,
+                                        forward_counts,
+                                        backward_counts,
+                                        strict=True,
+                                    )
+                                    if recorded != forward or recorded != backward
+                                ]
+                                raise RuntimeError(
+                                    "[PR2_VALIDATE] Top-k cache was not fully consumed: "
+                                    f"rollout={rollout_id}, manager={replay_manager.name}, "
+                                    "mismatches(layer, recorded, forward, backward)="
+                                    f"{mismatches}"
+                                )
+
+                    if remaining != 0:
+                        raise RuntimeError(
+                            "Predictive routing replay buffer was not fully consumed during actor training: "
+                            f"remaining={remaining}"
+                        )
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -642,6 +790,46 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
+
+            if _pr2_validate_enabled():
+                version_validation_error = None
+                if dist.get_rank() == 0:
+                    try:
+                        if not rollout_engines:
+                            raise RuntimeError("No rollout engines were available for weight-version validation.")
+                        engine_versions = ray.get(
+                            [engine.get_weight_version.remote() for engine in rollout_engines],
+                            timeout=60,
+                        )
+                        expected_version = str(self.weight_updater.weight_version)
+                        lead_engine_versions = [version for version in engine_versions if version is not None]
+                        versions_match = bool(lead_engine_versions) and all(
+                            str(version) == expected_version for version in lead_engine_versions
+                        )
+                        logger.info(
+                            "[PR2_VALIDATE] base_sync_complete expected_version=%s engine_versions=%s "
+                            "lead_engine_count=%s full=%s",
+                            expected_version,
+                            engine_versions,
+                            len(lead_engine_versions),
+                            versions_match,
+                        )
+                        if not versions_match:
+                            version_validation_error = (
+                                "Rollout-engine weight-version mismatch: "
+                                f"expected={expected_version}, engine_versions={engine_versions}"
+                            )
+                    except Exception as exc:
+                        version_validation_error = f"Weight-version query failed: {type(exc).__name__}: {exc}"
+                        logger.exception("[PR2_VALIDATE] base_sync_query_failed")
+
+                # Keep every training rank out of model-queue collectives until rank 0
+                # finishes the bounded engine queries, and propagate failure so no rank
+                # is left waiting in a later model-queue collective.
+                validation_result = [version_validation_error]
+                dist.broadcast_object_list(validation_result, src=0, group=get_gloo_group())
+                if validation_result[0] is not None:
+                    raise RuntimeError(f"[PR2_VALIDATE] {validation_result[0]}")
 
             if self.args.ci_test and len(rollout_engines) > 0 and not is_lora_enabled(self.args):
                 engine = random.choice(rollout_engines)

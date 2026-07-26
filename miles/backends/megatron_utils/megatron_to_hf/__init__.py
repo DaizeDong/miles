@@ -21,6 +21,10 @@ def postprocess_hf_param(args, megatron_param_name, hf_param_name, param):
 
 # TODO optimize code details
 def convert_to_hf(args, model_name, name, param, quantization_config=None):
+    # The predictor is a training-only PR2 head and has no HF/SGLang target.
+    if "bias_predictor" in name:
+        return []
+
     param = remove_padding(name, param, args.vocab_size)
 
     converted_named_tensors = _convert_to_hf_core(args, model_name, name, param)

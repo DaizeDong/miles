@@ -1,4 +1,3 @@
-import copy
 import dataclasses
 import gc
 import inspect
@@ -49,6 +48,7 @@ from .ci_utils import (
     compute_model_hashes_by_layer,
     save_model_hashes,
 )
+from .dist_ckpt_compat import install_dp_reshardable_hdo_step_compat, maybe_validate_pr2_optimizer_resume
 from .initialize import is_megatron_main_rank
 from .lora_utils import is_lora_enabled, is_lora_model
 from .model_provider import get_model_provider_func
@@ -123,15 +123,17 @@ def _build_optimizer_config_overrides(args: Namespace, config: OptimizerConfig, 
     if ParamKey is None:
         raise RuntimeError("Predictive routing replay requires megatron.core.optimizer.ParamKey support.")
 
-    bias_predictor_optim_config = copy.deepcopy(config)
-    bias_predictor_optim_config.lr = config.lr * args.bias_predictor_lr_mult
+    predictor_lr = config.lr * args.bias_predictor_lr_mult
     logger.info(
         "[Predictive Routing Replay] Bias predictor optimizer override enabled: base_lr=%s lr_mult=%s predictor_lr=%s",
         config.lr,
         args.bias_predictor_lr_mult,
-        bias_predictor_optim_config.lr,
+        predictor_lr,
     )
-    return {ParamKey(attr="is_bias_predictor"): bias_predictor_optim_config}
+    # Current Megatron expects a ParamGroupOverride mapping here, not a full
+    # OptimizerConfig.  A max_lr override also marks this group as using its own
+    # LR schedule while retaining the base optimizer implementation/options.
+    return {ParamKey(attr="is_bias_predictor"): {"max_lr": predictor_lr}}
 
 
 def get_optimizer_param_scheduler(
@@ -335,6 +337,7 @@ def _collect_recorded_predictive_microbatch(
             allgather_cp=args.allgather_cp,
             downsample_batch_size=getattr(args, "predictive_downsample_batch_size", None),
             max_len_limit=getattr(args, "predictive_downsample_max_len_limit", None),
+            max_total_tokens=getattr(args, "predictive_max_total_tokens", None),
             storage_dtype=getattr(args, "predictive_storage_dtype", "fp32"),
         )
     )
@@ -1179,6 +1182,20 @@ def initialize_model_and_optimizer(
         tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
             DDP-wrapped model chunks, optimizer, scheduler, and iteration index.
     """
+    # PR commit 38ae6ccf accidentally removed the ROCm checkpoint-writer
+    # override that existed in the base implementation.  The stock Megatron
+    # writer preloads into pinned memory and then forks writer processes, a
+    # combination that segfaults on HIP (reproduced by job 48525).  Restore the
+    # project-provided writer before checkpoint strategies are constructed.
+    if torch.version.hip:
+        import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
+
+        from miles.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
+
+        filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
+        print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
+
+    install_dp_reshardable_hdo_step_compat()
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
 
@@ -1221,5 +1238,7 @@ def initialize_model_and_optimizer(
                 pg["max_lr"] = expected_max_lr
 
     opt_param_scheduler.step(increment=iteration * args.global_batch_size)
+    if role == "actor":
+        maybe_validate_pr2_optimizer_resume(args, optimizer, iteration)
 
     return model, optimizer, opt_param_scheduler, iteration

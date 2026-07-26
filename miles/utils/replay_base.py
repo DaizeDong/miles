@@ -351,6 +351,9 @@ def apply_routing_replay_patch() -> None:
         fused: bool,
         router_replay: Replay | None,
         layer_number: int | None,
+        is_mtp: bool = False,
+        tid2eid: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
     ):
         del fused
         num_tokens, num_experts = logits.shape
@@ -367,12 +370,17 @@ def apply_routing_replay_patch() -> None:
                 )
             return torch.topk(scores, k=topk, dim=1)
 
-        compute_topk = routing_replay_manager.get_topk_fn(
-            _compute_topk,
-            return_probs=True,
-            replay=router_replay,
-            layer_number=layer_number,
-        )
+        # MTP layers cannot use rollout routing replay. Hash-routed layers are
+        # deterministic and also bypass replay, matching Megatron's router.
+        if not is_mtp and tid2eid is None:
+            compute_topk = routing_replay_manager.get_topk_fn(
+                _compute_topk,
+                return_probs=True,
+                replay=router_replay,
+                layer_number=layer_number,
+            )
+        else:
+            compute_topk = _compute_topk
 
         if score_function == "softmax":
             if use_pre_softmax:
@@ -390,6 +398,21 @@ def apply_routing_replay_patch() -> None:
             else:
                 scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
             probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        elif score_function == "sqrtsoftplus":
+            assert num_groups is None
+            assert group_topk is None
+            scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+            if tid2eid is not None:
+                assert not tid2eid.requires_grad
+                assert input_ids is not None and not input_ids.requires_grad
+                top_indices = tid2eid[input_ids]
+                assert torch.all(top_indices >= 0)
+            else:
+                assert expert_bias is not None
+                scores_for_routing = scores + expert_bias
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -410,10 +433,22 @@ def apply_routing_replay_patch() -> None:
 
         return routing_probs, routing_map
 
-    def patched_routing(self, logits: torch.Tensor):
+    def patched_routing(
+        self,
+        logits: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+    ):
+        if getattr(self.config, "dsv4_mode", False):
+            assert self._routing_mode_initialized
+
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
-        logits = self.apply_z_loss(logits)
+
+        if padding_mask is not None:
+            padding_mask = padding_mask.reshape(-1)
+
+        logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
@@ -430,6 +465,13 @@ def apply_routing_replay_patch() -> None:
                 fused=self.config.moe_router_fusion,
                 router_replay=getattr(self, "routing_replay", None),
                 layer_number=getattr(self, "layer_number", None),
+                is_mtp=getattr(self, "is_mtp", False),
+                tid2eid=getattr(self, "tid2eid", None),
+                input_ids=(
+                    input_ids.view(-1)
+                    if getattr(self, "tid2eid", None) is not None and input_ids is not None
+                    else None
+                ),
             )
 
         if self.config.moe_expert_capacity_factor is not None:
@@ -444,15 +486,34 @@ def apply_routing_replay_patch() -> None:
 
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
-                logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
+                logits,
+                self.topk,
+                self.score_function,
+                fused=self.config.moe_router_fusion,
+                padding_mask=padding_mask,
             )
-            probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
-            probs = self._apply_seq_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz)
-            probs = self._apply_global_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
+            probs = self._apply_aux_loss(
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                with_padding_mask=padding_mask is not None,
+            )
+            probs = self._apply_seq_aux_loss(
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                seq_length,
+                bsz,
+                with_padding_mask=padding_mask is not None,
+            )
+            probs = self._apply_global_aux_loss(
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                with_padding_mask=padding_mask is not None,
+            )
 
-        if getattr(self, "enable_expert_bias", False) and torch.is_grad_enabled():
-            with torch.no_grad():
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
         return probs, routing_map
 

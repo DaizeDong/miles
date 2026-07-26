@@ -7,9 +7,12 @@ from miles.backends.megatron_utils.predictive_router_replay import (
     PREDICTIVE_LAYER_SCALE_SCHEDULES,
     PredictiveRouterReplayState,
     RouterPredictiveAction,
+    _build_bias_predictor,
     _ensure_bias_predictor_runtime_placement,
+    apply_predictive_route_noise,
     build_synthetic_predictive_loss,
     calculate_topk_accuracy,
+    calculate_routing_map_topk_accuracy,
     clear_predictive_optimizer_grads,
     compute_predictive_layer_scale,
     compute_predictive_bias_ratio,
@@ -61,6 +64,165 @@ def test_build_synthetic_predictive_loss_returns_zero_with_intact_param_graph():
         assert torch.equal(param.grad, torch.zeros_like(param))
     # Input is .detach()'d inside, so its grad must remain None.
     assert input_tensor.grad is None
+
+
+def _make_predictor_test_router(hidden_size=2048, num_experts=64):
+    return SimpleNamespace(
+        gating=torch.nn.Linear(hidden_size, num_experts, bias=False),
+        config=SimpleNamespace(hidden_size=hidden_size, num_moe_experts=num_experts),
+    )
+
+
+def test_bias_predictor_architectures_are_zero_initialized_and_parameter_matched():
+    torch.manual_seed(7)
+    router = _make_predictor_test_router()
+    linear = _build_bias_predictor(router, architecture="linear", hidden_size=64)
+    mlp = _build_bias_predictor(router, architecture="mlp", hidden_size=64)
+    inputs = torch.randn(3, 2048)
+
+    # Keep the paper/default checkpoint schema unchanged.
+    assert list(linear.state_dict()) == ["weight"]
+    assert list(mlp.state_dict()) == ["0.weight", "2.weight"]
+    assert sum(param.numel() for param in linear.parameters()) == 131_072
+    assert sum(param.numel() for param in mlp.parameters()) == 135_168
+    assert sum(param.numel() for param in mlp.parameters()) / sum(param.numel() for param in linear.parameters()) == pytest.approx(
+        1.03125
+    )
+    assert torch.equal(linear(inputs), torch.zeros(3, 64))
+    assert torch.equal(mlp(inputs), torch.zeros(3, 64))
+    assert all(getattr(param, "is_bias_predictor", False) for param in mlp.parameters())
+
+
+def test_mlp_predictor_checkpoint_round_trip_and_architecture_mismatch_is_strict():
+    torch.manual_seed(11)
+    router = _make_predictor_test_router(hidden_size=8, num_experts=4)
+    source = _build_bias_predictor(router, architecture="mlp", hidden_size=3)
+    with torch.no_grad():
+        for param in source.parameters():
+            param.add_(torch.randn_like(param))
+
+    restored = _build_bias_predictor(router, architecture="mlp", hidden_size=3)
+    restored.load_state_dict(source.state_dict(), strict=True)
+    for source_param, restored_param in zip(source.parameters(), restored.parameters(), strict=True):
+        assert torch.equal(source_param, restored_param)
+
+    linear = _build_bias_predictor(router, architecture="linear", hidden_size=3)
+    with pytest.raises(RuntimeError):
+        linear.load_state_dict(source.state_dict(), strict=True)
+
+
+def test_mlp_predictor_both_layers_join_learning_after_zero_init_warmup():
+    torch.manual_seed(17)
+    router = _make_predictor_test_router(hidden_size=8, num_experts=4)
+    predictor = _build_bias_predictor(router, architecture="mlp", hidden_size=3)
+    optimizer = torch.optim.SGD(predictor.parameters(), lr=0.2)
+    inputs = torch.randn(6, 8)
+    target = torch.randn(6, 4)
+
+    first_loss = torch.nn.functional.mse_loss(predictor(inputs), target)
+    first_loss.backward()
+    assert torch.count_nonzero(predictor[0].weight.grad) == 0
+    assert torch.count_nonzero(predictor[2].weight.grad) > 0
+    optimizer.step()
+    optimizer.zero_grad()
+
+    second_loss = torch.nn.functional.mse_loss(predictor(inputs), target)
+    second_loss.backward()
+    assert torch.count_nonzero(predictor[0].weight.grad) > 0
+    assert torch.count_nonzero(predictor[2].weight.grad) > 0
+
+
+def test_predictive_route_noise_is_deterministic_and_zero_is_bitwise_identity():
+    effective_logits = torch.tensor(
+        [[4.0, 3.0, 2.0, 1.0], [1.0, 3.0, 2.0, 4.0]],
+        dtype=torch.float32,
+    )
+    identity, identity_metrics = apply_predictive_route_noise(
+        effective_logits=effective_logits,
+        noise_std=0.0,
+        noise_seed=123,
+    )
+    noisy_a, metrics_a = apply_predictive_route_noise(
+        effective_logits=effective_logits,
+        noise_std=2.0,
+        noise_seed=123,
+    )
+    noisy_b, metrics_b = apply_predictive_route_noise(
+        effective_logits=effective_logits,
+        noise_std=2.0,
+        noise_seed=123,
+    )
+    noisy_other_seed, _ = apply_predictive_route_noise(
+        effective_logits=effective_logits,
+        noise_std=2.0,
+        noise_seed=124,
+    )
+
+    assert identity is effective_logits
+    assert torch.equal(identity, effective_logits)
+    assert identity_metrics == {
+        "predictive_route_noise_scale": 0.0,
+        "predictive_route_noise_abs_mean": 0.0,
+    }
+    assert torch.equal(noisy_a, noisy_b)
+    assert metrics_a == metrics_b
+    assert not torch.equal(noisy_a, noisy_other_seed)
+    assert torch.equal(effective_logits, torch.tensor([[4.0, 3.0, 2.0, 1.0], [1.0, 3.0, 2.0, 4.0]]))
+    assert metrics_a["predictive_route_noise_scale"] > 0
+
+
+def test_predictive_route_noise_seed_schedule_is_reproducible_and_call_specific():
+    controller = get_predictive_replay_controller()
+    controller.reset_registry()
+    controller.begin_recording_round()
+    first_sequence = [
+        controller.next_record_noise_seed(base_seed=42, layer_idx=0),
+        controller.next_record_noise_seed(base_seed=42, layer_idx=0),
+        controller.next_record_noise_seed(base_seed=42, layer_idx=1),
+    ]
+
+    controller.reset_registry()
+    controller.begin_recording_round()
+    repeated_sequence = [
+        controller.next_record_noise_seed(base_seed=42, layer_idx=0),
+        controller.next_record_noise_seed(base_seed=42, layer_idx=0),
+        controller.next_record_noise_seed(base_seed=42, layer_idx=1),
+    ]
+
+    assert repeated_sequence == first_sequence
+    assert len(set(first_sequence)) == len(first_sequence)
+
+
+def test_predictive_route_noise_seed_uses_rollout_id_across_fresh_resume():
+    controller = get_predictive_replay_controller()
+    controller.reset_registry()
+    controller.set_current_step_context(rollout_id=17, step_id=None)
+    controller.begin_recording_round()
+    uninterrupted_seed = controller.next_record_noise_seed(base_seed=42, layer_idx=3)
+
+    controller.reset_registry()
+    for _ in range(5):
+        controller.begin_recording_round()
+    controller.set_current_step_context(rollout_id=17, step_id=None)
+    controller.begin_recording_round()
+    resumed_seed = controller.next_record_noise_seed(base_seed=42, layer_idx=3)
+
+    assert resumed_seed == uninterrupted_seed
+
+
+def test_calculate_routing_map_topk_accuracy_measures_executed_support():
+    current_logits = torch.tensor([[4.0, 3.0, 2.0, 1.0], [1.0, 2.0, 3.0, 4.0]])
+    routing_map = torch.tensor(
+        [[True, False, True, False], [False, True, False, True]],
+        dtype=torch.bool,
+    )
+
+    # Current top-2 are {0,1} and {3,2}; one of two slots overlaps per token.
+    assert calculate_routing_map_topk_accuracy(
+        routing_map=routing_map,
+        current_logits=current_logits,
+        topk=2,
+    ) == pytest.approx(0.5)
 
 
 def test_pack_recorded_predictive_microbatch_builds_mask_and_storage():

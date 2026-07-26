@@ -35,6 +35,10 @@ def _install_argument_test_stubs():
 
     if "ray" not in sys.modules:
         ray_module = types.ModuleType("ray")
+        ray_actor_module = types.ModuleType("ray.actor")
+
+        class ActorHandle:
+            pass
 
         def remote(*args, **kwargs):
             def decorator(fn):
@@ -47,12 +51,15 @@ def _install_argument_test_stubs():
         ray_module.shutdown = lambda *args, **kwargs: None
         ray_module.get = lambda refs: refs
         ray_module.nodes = lambda: []
+        ray_module.actor = ray_actor_module
+        ray_actor_module.ActorHandle = ActorHandle
         ray_private_module = types.ModuleType("ray._private")
         services_module = types.ModuleType("ray._private.services")
         services_module.get_node_ip_address = lambda: "127.0.0.1"
         ray_private_module.services = services_module
         ray_module._private = ray_private_module
         sys.modules["ray"] = ray_module
+        sys.modules["ray.actor"] = ray_actor_module
         sys.modules["ray._private"] = ray_private_module
         sys.modules["ray._private.services"] = services_module
 
@@ -120,6 +127,7 @@ _install_argument_test_stubs()
 
 arguments = importlib.import_module("miles.utils.arguments")
 PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES = arguments.PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES
+PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES = arguments.PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES
 PREDICTIVE_ROUTING_REPLAY_LAYER_SCALE_SCHEDULES = arguments.PREDICTIVE_ROUTING_REPLAY_LAYER_SCALE_SCHEDULES
 PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES = arguments.PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES
 _validate_predictive_routing_replay_args = arguments._validate_predictive_routing_replay_args
@@ -137,7 +145,11 @@ def _make_validation_args(**overrides):
     values = {
         "enable_predictive_routing_replay": False,
         "bias_predictor_loss_type": "kl-post",
+        "bias_predictor_architecture": "linear",
+        "bias_predictor_hidden_size": 64,
         "bias_predictor_lr_mult": 1000.0,
+        "predictive_route_noise_std": 0.0,
+        "predictive_route_noise_seed": 42,
         "predictive_downsample_batch_size": None,
         "predictive_downsample_max_len_limit": None,
         "predictive_max_total_tokens": None,
@@ -164,8 +176,16 @@ def test_predictive_flags_parse():
             "--enable-predictive-routing-replay",
             "--bias-predictor-loss-type",
             "kl-post",
+            "--bias-predictor-architecture",
+            "mlp",
+            "--bias-predictor-hidden-size",
+            "64",
             "--bias-predictor-lr-mult",
             "321.0",
+            "--predictive-route-noise-std",
+            "0.75",
+            "--predictive-route-noise-seed",
+            "1234",
             "--predictive-downsample-batch-size",
             "4",
             "--predictive-downsample-max-len-limit",
@@ -187,7 +207,11 @@ def test_predictive_flags_parse():
 
     assert args.enable_predictive_routing_replay is True
     assert args.bias_predictor_loss_type == "kl-post"
+    assert args.bias_predictor_architecture == "mlp"
+    assert args.bias_predictor_hidden_size == 64
     assert args.bias_predictor_lr_mult == pytest.approx(321.0)
+    assert args.predictive_route_noise_std == pytest.approx(0.75)
+    assert args.predictive_route_noise_seed == 1234
     assert args.predictive_downsample_batch_size == 4
     assert args.predictive_downsample_max_len_limit == 1024
     assert args.predictive_max_total_tokens == 2048
@@ -238,6 +262,48 @@ def test_predictive_validation_sets_aliases():
 
 def test_predictive_layer_scale_schedule_choices_exported():
     assert PREDICTIVE_ROUTING_REPLAY_LAYER_SCALE_SCHEDULES == ("none", "linear_decay", "sqrt_decay", "cosine_decay")
+
+
+def test_predictive_architecture_choices_exported():
+    assert PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES == ("linear", "mlp")
+
+
+@pytest.mark.parametrize("architecture", PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES)
+def test_predictive_validation_accepts_supported_architectures(architecture):
+    args = _make_validation_args(
+        enable_predictive_routing_replay=True,
+        use_routing_replay=True,
+        bias_predictor_architecture=architecture,
+    )
+
+    _validate_predictive_routing_replay_args(args)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"bias_predictor_hidden_size": 0}, "bias-predictor-hidden-size"),
+        ({"predictive_route_noise_std": -0.1}, "predictive-route-noise-std"),
+        ({"predictive_route_noise_std": float("nan")}, "predictive-route-noise-std"),
+        ({"predictive_route_noise_seed": -1}, "predictive-route-noise-seed"),
+    ],
+)
+def test_predictive_validation_rejects_invalid_architecture_controls(overrides, message):
+    args = _make_validation_args(
+        enable_predictive_routing_replay=True,
+        use_routing_replay=True,
+        **overrides,
+    )
+
+    with pytest.raises(AssertionError, match=message):
+        _validate_predictive_routing_replay_args(args)
+
+
+def test_predictive_route_noise_requires_predictive_replay():
+    args = _make_validation_args(predictive_route_noise_std=0.5)
+
+    with pytest.raises(AssertionError, match="requires --enable-predictive-routing-replay"):
+        _validate_predictive_routing_replay_args(args)
 
 
 def test_predictive_validation_rejects_invalid_stabilizer_args():
@@ -379,8 +445,9 @@ def test_router_logits_validation_normalizes_empty_path():
     assert args.router_logits_path is None
 
 
-def test_router_logits_validation_rejects_nonpositive_save_frequency():
+def test_router_logits_validation_accepts_zero_save_frequency_as_disabled():
     args = Namespace(router_logits_path="/tmp/router_logits", router_logits_save_freq=0)
 
-    with pytest.raises(AssertionError, match="router-logits-save-freq"):
-        _validate_router_logits_args(args)
+    _validate_router_logits_args(args)
+
+    assert args.router_logits_save_freq == 0
