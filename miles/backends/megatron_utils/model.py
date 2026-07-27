@@ -159,10 +159,18 @@ def get_optimizer_param_scheduler(
     """
     # Iteration-based training.
     args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+
+    # Eval-only runs deliberately use ``--num-rollout 0`` so the training loop
+    # performs no optimizer updates.  Megatron still constructs an optimizer
+    # scheduler while loading the actor, and that scheduler rejects zero decay
+    # or weight-decay horizons.  Give the otherwise-unused scheduler one dummy
+    # iteration without changing ``args.train_iters`` (which must remain zero
+    # for the eval-only control flow).  Positive-length training is unchanged.
+    scheduler_train_iters = 1 if args.num_rollout == 0 else args.train_iters
     if args.lr_decay_iters is None:
-        args.lr_decay_iters = args.train_iters
+        args.lr_decay_iters = scheduler_train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-    wd_incr_steps = args.train_iters * args.global_batch_size
+    wd_incr_steps = scheduler_train_iters * args.global_batch_size
     wsd_decay_steps = None
     if args.lr_wsd_decay_iters is not None:
         wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
