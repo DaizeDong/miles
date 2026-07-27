@@ -1,0 +1,469 @@
+"""Opt-in, process-local measurements for the P0-B fixed-rollout profile.
+
+This module deliberately reports only quantities observed by trusted runtime
+sources.  Ray object-store/spill values come from Ray's pinned 2.44.1 global
+memory-info reply.  Collective traffic is not inferred from tensor sizes; it
+is emitted as JSON ``null`` until a source can measure the claimed quantity.
+The feature is inert unless ``MILES_P0B_SYSTEM_PROFILE=1``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import socket
+import time
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
+
+
+_ENABLED_ENV = "MILES_P0B_SYSTEM_PROFILE"
+_OUTERS_ENV = "MILES_P0B_MEASURED_OUTER_IDS"
+_DEFAULT_MEASURED_OUTERS = frozenset(range(3, 13))
+_PINNED_RAY_VERSION = "2.44.1"
+
+
+class _RayObjectStoreReader:
+    """Read Ray's cluster-global object-store counters through the pinned API.
+
+    The state connection is cached, but each call performs a fresh
+    ``FormatGlobalMemoryInfo`` RPC.  Imports are lazy so the default-off path
+    neither imports Ray nor opens a control-plane connection.
+    """
+
+    def __init__(self) -> None:
+        self._state: Any = None
+
+    def __call__(self) -> Mapping[str, Any]:
+        import ray
+        from ray._private import internal_api
+
+        version = str(ray.__version__)
+        if version != _PINNED_RAY_VERSION:
+            raise RuntimeError(
+                f"P0-B Ray counters require Ray {_PINNED_RAY_VERSION}, got {version}"
+            )
+        if self._state is None:
+            self._state = internal_api.get_state_from_address()
+        reply = internal_api.get_memory_info_reply(self._state)
+        stats = reply.store_stats
+        return {
+            "object_store_bytes_used": stats.object_store_bytes_used,
+            "spilled_bytes_total": stats.spilled_bytes_total,
+            "ray_version": version,
+            "source": "ray._private.internal_api.get_memory_info_reply",
+        }
+
+
+def _validated_ray_snapshot(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the two counters without coercing malformed values to zero."""
+
+    values: dict[str, int] = {}
+    for name in ("object_store_bytes_used", "spilled_bytes_total"):
+        value = raw.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"invalid Ray counter {name}={value!r}")
+        values[name] = value
+    return {
+        "available": True,
+        **values,
+        "ray_version": raw.get("ray_version"),
+        "source": raw.get("source"),
+    }
+
+
+def _profile_enabled(environ: Mapping[str, str]) -> bool:
+    raw = environ.get(_ENABLED_ENV)
+    if raw is None or raw == "0":
+        return False
+    if raw == "1":
+        return True
+    raise ValueError(f"{_ENABLED_ENV} must be exactly '0' or '1', got {raw!r}")
+
+
+def _measured_outer_ids(environ: Mapping[str, str]) -> frozenset[int]:
+    raw = environ.get(_OUTERS_ENV)
+    if raw is None:
+        return _DEFAULT_MEASURED_OUTERS
+    values = [part.strip() for part in raw.split(",")]
+    if not values or any(not part for part in values):
+        raise ValueError(f"{_OUTERS_ENV} must be a non-empty comma-separated integer list")
+    try:
+        parsed = [int(part) for part in values]
+    except ValueError as exc:
+        raise ValueError(f"{_OUTERS_ENV} contains a non-integer value: {raw!r}") from exc
+    if any(outer_id < 0 for outer_id in parsed):
+        raise ValueError(f"{_OUTERS_ENV} cannot contain negative outer IDs: {raw!r}")
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"{_OUTERS_ENV} cannot contain duplicate outer IDs: {raw!r}")
+    return frozenset(parsed)
+
+
+def _proc_memory_bytes(path: str = "/proc/self/status") -> tuple[int | None, int | None]:
+    """Return Linux process (current RSS, lifetime peak RSS) in bytes."""
+
+    values: dict[str, int] = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                key, separator, remainder = line.partition(":")
+                if separator and key in {"VmRSS", "VmHWM"}:
+                    fields = remainder.split()
+                    if len(fields) >= 2 and fields[1] == "kB":
+                        values[key] = int(fields[0]) * 1024
+    except (OSError, ValueError):
+        return None, None
+    return values.get("VmRSS"), values.get("VmHWM")
+
+
+def _storage_identity_and_bytes(value: Any) -> tuple[object, int]:
+    """Return a stable-in-process tensor storage identity and allocated bytes."""
+
+    try:
+        storage = value.untyped_storage()
+        size = int(storage.nbytes())
+        try:
+            identity: object = (str(value.device), int(storage.data_ptr()), size)
+        except Exception:
+            identity = id(storage)
+        return identity, size
+    except Exception:
+        logical = int(value.numel()) * int(value.element_size())
+        return id(value), logical
+
+
+def tensor_payload_stats(value: Any, torch_module: Any) -> dict[str, int]:
+    """Measure recursive tensor/ndarray bytes without serializing the payload.
+
+    ``logical_bytes`` sums tensor views. ``unique_storage_bytes`` deduplicates
+    shared tensor storage and NumPy base arrays, which is the closer local
+    retained-memory quantity. Python-container and Ray wire-format overhead are
+    intentionally excluded.
+    """
+
+    logical_bytes = 0
+    unique_storage_bytes = 0
+    tensor_count = 0
+    ndarray_count = 0
+    seen_objects: set[int] = set()
+    seen_storages: set[object] = set()
+
+    def visit(item: Any) -> None:
+        nonlocal logical_bytes, unique_storage_bytes, tensor_count, ndarray_count
+        if item is None or isinstance(item, (str, bytes, bytearray, int, float, bool)):
+            return
+        try:
+            is_tensor = bool(torch_module.is_tensor(item))
+        except Exception:
+            is_tensor = False
+        if is_tensor:
+            tensor_count += 1
+            logical_bytes += int(item.numel()) * int(item.element_size())
+            identity, storage_bytes = _storage_identity_and_bytes(item)
+            if identity not in seen_storages:
+                seen_storages.add(identity)
+                unique_storage_bytes += storage_bytes
+            return
+
+        # Avoid importing NumPy in this opt-in utility. Its public array
+        # protocol is sufficient for byte accounting.
+        if hasattr(item, "nbytes") and hasattr(item, "__array_interface__"):
+            ndarray_count += 1
+            item_bytes = int(item.nbytes)
+            logical_bytes += item_bytes
+            owner = item
+            while getattr(owner, "base", None) is not None:
+                owner = owner.base
+            identity = ("numpy", id(owner))
+            if identity not in seen_storages:
+                seen_storages.add(identity)
+                unique_storage_bytes += int(getattr(owner, "nbytes", item_bytes))
+            return
+
+        object_id = id(item)
+        if object_id in seen_objects:
+            return
+        seen_objects.add(object_id)
+        if dataclasses.is_dataclass(item) and not isinstance(item, type):
+            for field in dataclasses.fields(item):
+                visit(getattr(item, field.name))
+        elif isinstance(item, Mapping):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, Sequence):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    return {
+        "logical_bytes": logical_bytes,
+        "unique_storage_bytes": unique_storage_bytes,
+        "tensor_count": tensor_count,
+        "ndarray_count": ndarray_count,
+    }
+
+
+def _sum_ints(values: Any) -> int | None:
+    if values is None:
+        return None
+    try:
+        return sum(int(value) for value in values)
+    except (TypeError, ValueError):
+        return None
+
+
+class P0BSystemProfiler:
+    """Collect one measured outer on the primary Megatron training rank."""
+
+    def __init__(
+        self,
+        *,
+        torch_module: Any,
+        rank: int,
+        world_size: int,
+        primary: bool,
+        environ: Mapping[str, str] | None = None,
+        output=print,
+        ray_snapshot_provider: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> None:
+        environ = os.environ if environ is None else environ
+        self._torch = torch_module
+        requested = _profile_enabled(environ)
+        self._measured_outers = _measured_outer_ids(environ)
+        self._enabled = primary and requested
+        self._rank = int(rank)
+        self._world_size = int(world_size)
+        self._output = output
+        self._ray_snapshot_provider = ray_snapshot_provider or _RayObjectStoreReader()
+        self._ray_start: dict[str, Any] | None = None
+        self._outer_id: int | None = None
+        self._detail: dict[str, Any] = {}
+        self._payload_stats: dict[str, int] = {
+            "logical_bytes": 0,
+            "unique_storage_bytes": 0,
+            "tensor_count": 0,
+            "ndarray_count": 0,
+        }
+        self._predictive_stats = dict(self._payload_stats)
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def begin_outer(self, outer_id: int) -> None:
+        if not self._enabled:
+            return
+        self._outer_id = int(outer_id)
+        self._ray_start = None
+        self._detail = {
+            "schema_version": 1,
+            "scope": "primary_training_rank_process_local",
+            "rank": self._rank,
+            "world_size": self._world_size,
+            "hostname": socket.gethostname().split(".", 1)[0],
+            "timestamps": {},
+            "unavailable": [
+                "actor_ray_transport_bytes",
+                "collective_bytes",
+                "collective_time_seconds",
+            ],
+        }
+        rss, peak_rss = _proc_memory_bytes()
+        self._detail["process_memory_at_start"] = {
+            "rss_bytes": rss,
+            "lifetime_peak_rss_bytes": peak_rss,
+        }
+        if self._outer_id in self._measured_outers:
+            self._ray_start = self._capture_ray_snapshot()
+        cuda = getattr(self._torch, "cuda", None)
+        if cuda is not None:
+            try:
+                cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+        # The evidence setup above is deliberately outside the measured
+        # outer interval.  ``emit_outer`` likewise marks the interval end
+        # before its end-of-outer RPC and serialization work.
+        self.mark("outer_start")
+
+    def mark(self, name: str) -> None:
+        if not self._enabled or self._outer_id is None:
+            return
+        self._detail.setdefault("timestamps", {})[name] = {
+            "wall_time_ns": time.time_ns(),
+            "monotonic_time_ns": time.perf_counter_ns(),
+        }
+
+    def observe_rollout_payload(self, rollout_data: Any) -> None:
+        if not self._enabled or self._outer_id is None:
+            return
+        self._payload_stats = tensor_payload_stats(rollout_data, self._torch)
+        total_lengths = rollout_data.get("total_lengths") if isinstance(rollout_data, Mapping) else None
+        response_lengths = rollout_data.get("response_lengths") if isinstance(rollout_data, Mapping) else None
+        self._detail["token_counts"] = {
+            "local_samples": len(total_lengths) if total_lengths is not None else None,
+            "local_total_tokens": _sum_ints(total_lengths),
+            "local_response_tokens": _sum_ints(response_lengths),
+        }
+        self._detail["rollout_payload_tensors"] = dict(self._payload_stats)
+
+    def observe_predictive_cache(self, microbatches: Any) -> None:
+        if not self._enabled or self._outer_id is None:
+            return
+        self._predictive_stats = tensor_payload_stats(microbatches, self._torch)
+        selected = sum(int(getattr(item, "selected_total_tokens", 0)) for item in microbatches)
+        original = sum(int(getattr(item, "original_total_tokens", 0)) for item in microbatches)
+        self._detail["retained_predictive_cache"] = {
+            **self._predictive_stats,
+            "microbatch_count": len(microbatches),
+            "selected_tokens": selected,
+            "original_tokens": original,
+        }
+
+    def observe_completed_actor_steps(self, num_steps_per_outer: int) -> None:
+        """Record the actor steps after the real training loop has returned."""
+
+        if not self._enabled or self._outer_id is None:
+            return
+        count = int(num_steps_per_outer)
+        first = self._outer_id * count
+        self._detail["completed_actor_steps"] = {
+            "count": count,
+            "step_ids": list(range(first, first + count)),
+        }
+
+    def emit_outer(self) -> None:
+        if not self._enabled or self._outer_id is None:
+            return
+        outer_id = self._outer_id
+        self.mark("outer_end_before_perf_log")
+        rss, peak_rss = _proc_memory_bytes()
+        accelerator = self._accelerator_memory()
+        self._detail["process_memory_at_end"] = {
+            "rss_bytes": rss,
+            "lifetime_peak_rss_bytes": peak_rss,
+        }
+        self._detail["accelerator_memory"] = accelerator
+        timestamps = self._detail["timestamps"]
+        start = timestamps.get("outer_start", {}).get("monotonic_time_ns")
+        end = timestamps.get("outer_end_before_perf_log", {}).get("monotonic_time_ns")
+        self._detail["outer_wall_seconds"] = None if start is None or end is None else (end - start) / 1e9
+        self._detail["phase_wall_seconds"] = {
+            phase: self._phase_seconds(timestamps, begin, finish)
+            for phase, begin, finish in (
+                ("data_preprocess", "data_preprocess_start", "data_preprocess_end"),
+                ("actor_update", "actor_update_start", "actor_update_end"),
+                ("training_pipeline", "training_pipeline_start", "training_pipeline_end"),
+            )
+        }
+
+        if outer_id in self._measured_outers:
+            ray_end = self._capture_ray_snapshot()
+            ray_object_store_bytes, ray_spill_bytes, ray_evidence = self._ray_outer_metrics(
+                self._ray_start, ray_end
+            )
+            self._detail["ray_object_store"] = ray_evidence
+            if ray_object_store_bytes is None:
+                self._detail["unavailable"].append("ray_object_store_bytes")
+            if ray_spill_bytes is None:
+                self._detail["unavailable"].append("ray_spill_bytes")
+            system = {
+                "gpu_allocated_bytes": accelerator["peak_allocated_bytes"],
+                "gpu_reserved_bytes": accelerator["peak_reserved_bytes"],
+                "host_rss_bytes": peak_rss,
+                "ray_object_store_bytes": ray_object_store_bytes,
+                "ray_spill_bytes": ray_spill_bytes,
+                "rollout_payload_bytes": self._payload_stats["unique_storage_bytes"],
+                "collective_bytes": None,
+                "collective_time_seconds": None,
+            }
+            compact = {key: value for key, value in self._detail.items()}
+            self._output(
+                f"P0B_DETAIL outer_id={outer_id} "
+                f"{json.dumps(compact, sort_keys=True, separators=(',', ':'))}",
+                flush=True,
+            )
+            self._output(
+                f"P0B_SYSTEM outer_id={outer_id} "
+                f"{json.dumps(system, sort_keys=True, separators=(',', ':'))}",
+                flush=True,
+            )
+        self._outer_id = None
+        self._ray_start = None
+
+    def _capture_ray_snapshot(self) -> dict[str, Any]:
+        try:
+            raw = self._ray_snapshot_provider()
+            if not isinstance(raw, Mapping):
+                raise TypeError(f"Ray snapshot must be a mapping, got {type(raw).__name__}")
+            return _validated_ray_snapshot(raw)
+        except Exception as exc:
+            return {
+                "available": False,
+                "error_type": type(exc).__name__,
+            }
+
+    @staticmethod
+    def _ray_outer_metrics(
+        begin: Mapping[str, Any] | None,
+        end: Mapping[str, Any],
+    ) -> tuple[int | None, int | None, dict[str, Any]]:
+        """Return end-of-outer usage and in-outer cumulative spill delta."""
+
+        end_available = bool(end.get("available"))
+        begin_available = begin is not None and bool(begin.get("available"))
+        object_store_bytes = int(end["object_store_bytes_used"]) if end_available else None
+        spill_bytes: int | None = None
+        spill_status = "unavailable"
+        if begin_available and end_available:
+            before = int(begin["spilled_bytes_total"])
+            after = int(end["spilled_bytes_total"])
+            if after >= before:
+                spill_bytes = after - before
+                spill_status = "measured_monotonic_delta"
+            else:
+                spill_status = "counter_regressed"
+        return object_store_bytes, spill_bytes, {
+            "scope": "ray_cluster_global",
+            "object_store_value": "end_of_outer_object_store_bytes_used_gauge",
+            "spill_value": "end_minus_begin_spilled_bytes_total",
+            "begin": begin,
+            "end": end,
+            "spill_status": spill_status,
+        }
+
+    @staticmethod
+    def _phase_seconds(timestamps: Mapping[str, Any], begin: str, finish: str) -> float | None:
+        started = timestamps.get(begin, {}).get("monotonic_time_ns")
+        ended = timestamps.get(finish, {}).get("monotonic_time_ns")
+        if started is None or ended is None:
+            return None
+        return (ended - started) / 1e9
+
+    def _accelerator_memory(self) -> dict[str, Any]:
+        cuda = getattr(self._torch, "cuda", None)
+        unavailable = {
+            "available": False,
+            "device": None,
+            "current_allocated_bytes": None,
+            "current_reserved_bytes": None,
+            "peak_allocated_bytes": None,
+            "peak_reserved_bytes": None,
+        }
+        if cuda is None:
+            return unavailable
+        try:
+            if not cuda.is_available():
+                return unavailable
+            device = int(cuda.current_device())
+            return {
+                "available": True,
+                "device": device,
+                "current_allocated_bytes": int(cuda.memory_allocated(device)),
+                "current_reserved_bytes": int(cuda.memory_reserved(device)),
+                "peak_allocated_bytes": int(cuda.max_memory_allocated(device)),
+                "peak_reserved_bytes": int(cuda.max_memory_reserved(device)),
+            }
+        except Exception:
+            return unavailable

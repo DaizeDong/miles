@@ -18,6 +18,7 @@ from miles.utils.context_utils import with_defer
 from miles.utils.distributed_utils import get_gloo_group, init_process_group
 from miles.utils.hf_config import load_hf_config
 from miles.utils.memory_utils import clear_memory, print_memory
+from miles.utils.p0b_system_profile import P0BSystemProfiler
 from miles.utils.processing_utils import load_tokenizer
 from miles.utils.ray_utils import Box
 from miles.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
@@ -98,6 +99,13 @@ class MegatronTrainRayActor(TrainRayActor):
             dumper.apply_source_patches()
 
         self._is_main_rank = is_megatron_main_rank()
+
+        self._p0b_system_profiler = P0BSystemProfiler(
+            torch_module=torch,
+            rank=dist.get_rank(),
+            world_size=dist.get_world_size(),
+            primary=self._is_main_rank and role == "actor",
+        )
 
         if self._is_main_rank:
             init_tracking(args, primary=False)
@@ -355,14 +363,25 @@ class MegatronTrainRayActor(TrainRayActor):
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
         self._last_rollout_id = rollout_id
+        if self.role == "actor":
+            if self._p0b_system_profiler.enabled:
+                # Exclude the two Ray memory-info RPCs from the canonical
+                # train_wait + train step-time evidence.
+                with inverse_timer("train_wait"):
+                    self._p0b_system_profiler.begin_outer(rollout_id)
+            else:
+                self._p0b_system_profiler.begin_outer(rollout_id)
         if self.args.offload_train:
             self.wake_up()
 
+        self._p0b_system_profiler.mark("data_preprocess_start")
         with timer("data_preprocess"):
             rollout_data = get_rollout_data(self.args, rollout_data_ref)
+            self._p0b_system_profiler.observe_rollout_payload(rollout_data)
             if self.args.debug_rollout_only:
                 log_rollout_data(rollout_id, self.args, rollout_data)
                 return
+        self._p0b_system_profiler.mark("data_preprocess_end")
 
         if self.role == "critic":
             return self.train_critic(rollout_id, rollout_data)
@@ -401,6 +420,7 @@ class MegatronTrainRayActor(TrainRayActor):
         return getattr(self.args, f"use_rollout_{m.name}_replay", False)
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
+        self._p0b_system_profiler.mark("training_pipeline_start")
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
         predictive_enabled = getattr(self.args, "enable_predictive_routing_replay", False)
@@ -571,6 +591,10 @@ class MegatronTrainRayActor(TrainRayActor):
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
 
+            # Snapshot the retained PR2 cache before the actor update consumes
+            # it. For GRPO/R2 this is an observed zero, not an estimate.
+            self._p0b_system_profiler.observe_predictive_cache(predictive_controller.microbatches)
+
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args)
 
@@ -578,6 +602,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             # Train
             self._set_replay_stage("replay_backward")
+            self._p0b_system_profiler.mark("actor_update_start")
             with timer("actor_train"):
                 if predictive_enabled:
                     logger.info(
@@ -668,6 +693,8 @@ class MegatronTrainRayActor(TrainRayActor):
                             "Predictive routing replay buffer was not fully consumed during actor training: "
                             f"remaining={remaining}"
                         )
+            self._p0b_system_profiler.observe_completed_actor_steps(len(num_microbatches))
+            self._p0b_system_profiler.mark("actor_update_end")
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -700,6 +727,16 @@ class MegatronTrainRayActor(TrainRayActor):
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
 
+        # The marker is emitted after every actor mini-step has completed and
+        # immediately before the existing perf/step_time completion log. The
+        # opt-in evidence RPC is excluded from that timer just like the begin
+        # RPC above; collective fields remain null unless directly measured.
+        self._p0b_system_profiler.mark("training_pipeline_end")
+        if self._p0b_system_profiler.enabled:
+            with inverse_timer("train_wait"):
+                self._p0b_system_profiler.emit_outer()
+        else:
+            self._p0b_system_profiler.emit_outer()
         log_perf_data(rollout_id, self.args)
 
     @timer
