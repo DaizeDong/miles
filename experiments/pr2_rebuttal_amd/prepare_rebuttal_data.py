@@ -740,7 +740,14 @@ def _provision_python_dependencies(stage: Path) -> dict[str, Any]:
             "fixed Miles container was validated with Python 3.10; refusing an unverified interpreter "
             f"{sys.version_info.major}.{sys.version_info.minor}"
         )
-    verifier_only_names = ("emoji", "immutabledict", "langdetect", "nltk", "syllapy")
+    verifier_only_names = (
+        "emoji",
+        "immutabledict",
+        "langdetect",
+        "nltk",
+        "syllapy",
+        "unicodedata2",
+    )
     protected_base_names = (
         "anyio",
         "httpx",
@@ -758,8 +765,8 @@ def _provision_python_dependencies(stage: Path) -> dict[str, Any]:
         "regex",
         "setuptools",
         "six",
+        "spacy",
         "tqdm",
-        "unicodedata2",
         "wheel",
     )
     inventory_names = tuple(
@@ -865,7 +872,7 @@ def _provision_python_dependencies(stage: Path) -> dict[str, Any]:
 
     base_probe = (
         "import absl,anyio,click,emoji,httpx,immutabledict,joblib,langdetect,nltk,pydantic,"
-        "pydantic_settings,regex,setuptools,six,syllapy,tqdm,unicodedata2,wheel; "
+        "pydantic_settings,regex,setuptools,six,spacy,syllapy,tqdm,unicodedata2,wheel; "
         "print('VERIFIER_DEPENDENCY_IMPORT_PROBE=PASS')"
     )
     _run_checked([sys.executable, "-c", base_probe], env=setup_env)

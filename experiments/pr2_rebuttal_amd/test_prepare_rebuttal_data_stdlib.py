@@ -146,9 +146,11 @@ class DataHardeningTests(unittest.TestCase):
         lock_path = Path(prep.__file__).with_name("verifier_requirements.lock")
         locked = prep._parse_requirements_lock(lock_path)
         self.assertEqual(
-            set(locked), {"emoji", "immutabledict", "langdetect", "nltk", "syllapy"}
+            set(locked),
+            {"emoji", "immutabledict", "langdetect", "nltk", "syllapy", "unicodedata2"},
         )
         self.assertEqual(locked["nltk"], "3.9.4")
+        self.assertEqual(locked["unicodedata2"], "17.0.1")
         hashes = prep._requirements_lock_hashes(lock_path)
         self.assertEqual(set(hashes), set(locked))
         self.assertTrue(all(values and all(len(value) == 64 for value in values) for values in hashes.values()))
