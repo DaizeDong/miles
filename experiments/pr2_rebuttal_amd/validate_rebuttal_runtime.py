@@ -96,6 +96,47 @@ def _parse_ifevalg(label: str) -> tuple[list[str], list[dict[str, Any] | None]]:
     return ids, kwargs
 
 
+def _official_strict_loose_smoke(
+    evaluation_lib: Any,
+    row: dict[str, Any],
+    instruction_id: str,
+    raw_kwargs: dict[str, Any] | None,
+) -> None:
+    """Execute the same two official functions used by the final eval hook."""
+
+    metadata = row.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("official evaluation smoke requires prepared metadata")
+    record_id = metadata.get("record_id")
+    prompt = metadata.get("prompt_text")
+    if isinstance(record_id, bool) or not isinstance(record_id, (str, int)):
+        raise RuntimeError("official evaluation smoke has an invalid record_id")
+    if not isinstance(prompt, str) or not prompt:
+        raise RuntimeError("official evaluation smoke has an invalid prompt_text")
+    kwargs = {} if raw_kwargs is None else copy.deepcopy(raw_kwargs)
+    if not isinstance(kwargs, dict):
+        raise RuntimeError("official evaluation smoke kwargs must be an object or null")
+
+    for mode in ("strict", "loose"):
+        input_example = evaluation_lib.InputExample(
+            key=copy.deepcopy(record_id),
+            instruction_id_list=[instruction_id],
+            prompt=prompt,
+            kwargs=[copy.deepcopy(kwargs)],
+        )
+        function = getattr(evaluation_lib, f"test_instruction_following_{mode}")
+        output = function(input_example, {prompt: "smoke response"})
+        decisions = list(output.follow_instruction_list)
+        if (
+            list(output.instruction_id_list) != [instruction_id]
+            or len(decisions) != 1
+            or bool(output.follow_all_instructions) != all(bool(value) for value in decisions)
+        ):
+            raise RuntimeError(
+                f"official {mode} evaluator output contract mismatch for {instruction_id!r}"
+            )
+
+
 def validate(bundle: Path) -> dict[str, Any]:
     bundle = bundle.resolve()
     target = (bundle / "third_party/python").resolve()
@@ -126,6 +167,14 @@ def validate(bundle: Path) -> dict[str, Any]:
             f"official Google IFEval registry loaded from {google_module_path}, expected {google_code}"
         )
     google_registry = google_registry_module.INSTRUCTION_DICT
+    google_evaluation_lib = importlib.import_module(
+        "instruction_following_eval.evaluation_lib"
+    )
+    google_evaluation_path = Path(google_evaluation_lib.__file__).resolve()
+    if not google_evaluation_path.is_relative_to(google_code):
+        raise RuntimeError(
+            f"official Google IFEval evaluator loaded from {google_evaluation_path}, expected {google_code}"
+        )
 
     unique_old: dict[str, dict[str, Any]] = {}
     old_contracts = 0
@@ -142,7 +191,7 @@ def validate(bundle: Path) -> dict[str, Any]:
         old_contracts += 1
 
     unique_ifevalg: dict[str, tuple[dict[str, Any], dict[str, Any] | None]] = {}
-    unique_google_official: set[str] = set()
+    unique_google_official: dict[str, tuple[dict[str, Any], dict[str, Any] | None]] = {}
     ifevalg_contracts = 0
     google_official_contracts = 0
     for filename in (OUTPUT_FILES["if_multi"], OUTPUT_FILES["google"]):
@@ -167,7 +216,7 @@ def validate(bundle: Path) -> dict[str, Any]:
                     google_instruction = google_registry[instruction_id](instruction_id)
                     inspect.signature(google_instruction.build_description).bind(**kwargs)
                     google_instruction.build_description(**copy.deepcopy(kwargs))
-                    unique_google_official.add(instruction_id)
+                    unique_google_official.setdefault(instruction_id, (row, raw_kwargs))
                     google_official_contracts += 1
 
     unique_ifbench: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
@@ -208,6 +257,12 @@ def validate(bundle: Path) -> dict[str, Any]:
         smoke_row["metadata"]["rm_type"] = "ifbench"
         asyncio.run(_miles_reward_smoke(smoke_row))
         smoke_calls += 1
+    for instruction_id, (row, raw_kwargs) in unique_google_official.items():
+        _official_strict_loose_smoke(
+            google_evaluation_lib, row, instruction_id, raw_kwargs
+        )
+    for instruction_id, (row, raw_kwargs) in unique_ifbench.items():
+        _official_strict_loose_smoke(evaluation_lib, row, instruction_id, raw_kwargs)
     math_row = next(_rows(bundle / OUTPUT_FILES["math"]), None)
     if math_row is None:
         raise RuntimeError("MATH-500 data is empty")
@@ -225,6 +280,8 @@ def validate(bundle: Path) -> dict[str, Any]:
         "unique_google_official_verifiers": sorted(unique_google_official),
         "unique_ifbench_verifiers": sorted(unique_ifbench),
         "miles_reward_smoke_calls": smoke_calls,
+        "google_official_strict_loose_smoke_pairs": len(unique_google_official),
+        "ifbench_official_strict_loose_smoke_pairs": len(unique_ifbench),
         "result": "PASS",
     }
 

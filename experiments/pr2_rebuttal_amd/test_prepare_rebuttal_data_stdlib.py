@@ -9,9 +9,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from subprocess import CompletedProcess
+from types import SimpleNamespace
 from unittest import mock
 
 from experiments.pr2_rebuttal_amd import prepare_rebuttal_data as prep
+from experiments.pr2_rebuttal_amd import validate_rebuttal_runtime as runtime_validator
 
 
 def _source(name: str) -> prep.FileSource:
@@ -173,6 +175,48 @@ class DataHardeningTests(unittest.TestCase):
             (root / "instructions.py").write_text("import spacy\n", encoding="utf-8")
             with self.assertRaisesRegex(prep.ValidationError, "excluded dependency spacy"):
                 prep._ifbench_unused_requirement_report(stage)
+
+    def test_official_strict_and_loose_runtime_smoke_uses_fresh_inputs(self) -> None:
+        calls: list[tuple[str, int]] = []
+
+        class FakeInput:
+            def __init__(self, key, instruction_id_list, prompt, kwargs):
+                self.key = key
+                self.instruction_id_list = instruction_id_list
+                self.prompt = prompt
+                self.kwargs = kwargs
+
+        class FakeEvaluationLib:
+            InputExample = FakeInput
+
+            @staticmethod
+            def test_instruction_following_strict(input_example, responses):
+                calls.append(("strict", id(input_example)))
+                input_example.kwargs[0]["strict_mutation"] = True
+                self.assertEqual(responses, {"prompt": "smoke response"})
+                return SimpleNamespace(
+                    instruction_id_list=["constraint:id"],
+                    follow_instruction_list=[False],
+                    follow_all_instructions=False,
+                )
+
+            @staticmethod
+            def test_instruction_following_loose(input_example, responses):
+                calls.append(("loose", id(input_example)))
+                self.assertNotIn("strict_mutation", input_example.kwargs[0])
+                self.assertEqual(responses, {"prompt": "smoke response"})
+                return SimpleNamespace(
+                    instruction_id_list=["constraint:id"],
+                    follow_instruction_list=[True],
+                    follow_all_instructions=True,
+                )
+
+        row = {"metadata": {"record_id": 7, "prompt_text": "prompt"}}
+        runtime_validator._official_strict_loose_smoke(
+            FakeEvaluationLib, row, "constraint:id", {"N": 1}
+        )
+        self.assertEqual([mode for mode, _ in calls], ["strict", "loose"])
+        self.assertNotEqual(calls[0][1], calls[1][1])
 
     def test_nltk_runtime_and_data_supply_chain_are_explicitly_pinned(self) -> None:
         self.assertEqual(prep.EXPECTED_CONTAINER_PYTHON, (3, 10))
