@@ -113,9 +113,13 @@ def _official_strict_loose_smoke(
         raise RuntimeError("official evaluation smoke has an invalid record_id")
     if not isinstance(prompt, str) or not prompt:
         raise RuntimeError("official evaluation smoke has an invalid prompt_text")
-    kwargs = {} if raw_kwargs is None else copy.deepcopy(raw_kwargs)
-    if not isinstance(kwargs, dict):
+    if raw_kwargs is not None and not isinstance(raw_kwargs, dict):
         raise RuntimeError("official evaluation smoke kwargs must be an object or null")
+    kwargs = (
+        {}
+        if raw_kwargs is None
+        else {key: copy.deepcopy(value) for key, value in raw_kwargs.items() if value is not None}
+    )
 
     for mode in ("strict", "loose"):
         input_example = evaluation_lib.InputExample(

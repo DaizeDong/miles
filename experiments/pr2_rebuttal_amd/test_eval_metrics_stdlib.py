@@ -37,6 +37,27 @@ def sample(name: str, rm_type: str, index: int, row: int, reward: float):
 
 
 class FrozenEvalMetricsTest(unittest.TestCase):
+    def test_official_metadata_removes_only_explicit_null_struct_fields(self) -> None:
+        class FakeInput:
+            def __init__(self, key, instruction_id_list, prompt, kwargs):
+                self.key = key
+                self.instruction_id_list = instruction_id_list
+                self.prompt = prompt
+                self.kwargs = kwargs
+
+        evaluation_lib = SimpleNamespace(InputExample=FakeInput)
+        metadata = {
+            "record_id": 3,
+            "prompt_text": "prompt",
+            "instruction_id_list": ["constraint:id"],
+            "kwargs": [{"unused": None, "zero": 0, "empty": "", "keyword": "kept"}],
+        }
+        result = METRICS._metadata_input(evaluation_lib, metadata)
+        self.assertEqual(
+            result.kwargs,
+            [{"zero": 0, "empty": "", "keyword": "kept"}],
+        )
+
     def test_per_dataset_n_metrics(self) -> None:
         self.assertEqual(METRICS.dataset_reward_metrics([1, 0], 1), {"avg@1": 0.5})
         result = METRICS.dataset_reward_metrics([1, 0, 0, 0], 4)

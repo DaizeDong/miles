@@ -126,7 +126,13 @@ def _metadata_input(evaluation_lib: Any, metadata: Any) -> Any:
         key=metadata["record_id"],
         instruction_id_list=list(instruction_ids),
         prompt=str(metadata["prompt_text"]),
-        kwargs=[dict(value) for value in kwargs],
+        # Parquet list-of-struct columns materialize unused union fields as
+        # explicit nulls.  IFBench strict drops them but loose does not; use
+        # the effective official kwargs for both modes.
+        kwargs=[
+            {key: item for key, item in value.items() if item is not None}
+            for value in kwargs
+        ],
     )
 
 

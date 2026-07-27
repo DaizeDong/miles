@@ -138,7 +138,12 @@ def test_if_multi_prompt_contracts_are_deterministically_consolidated() -> None:
 
 
 def test_google_and_ifbench_routes_are_distinct() -> None:
-    row = {"key": 1, "prompt": "x", "instruction_id_list": ["a:b"], "kwargs": [{}]}
+    row = {
+        "key": 1,
+        "prompt": "x",
+        "instruction_id_list": ["a:b"],
+        "kwargs": [{"N": None, "keyword": "keep", "zero": 0, "empty": ""}],
+    }
     google = prep._convert_new_ifeval(
         [row],
         _source("google_ifeval"),
@@ -154,6 +159,10 @@ def test_google_and_ifbench_routes_are_distinct() -> None:
     assert google[0]["metadata"]["rm_type"] == "ifevalg"
     assert ifbench[0]["metadata"]["rm_type"] == "ifbench"
     assert google[0]["metadata"]["verifier_schema"] != ifbench[0]["metadata"]["verifier_schema"]
+    effective_kwargs = {"keyword": "keep", "zero": 0, "empty": ""}
+    assert google[0]["metadata"]["kwargs"] == [effective_kwargs]
+    assert ifbench[0]["metadata"]["kwargs"] == [effective_kwargs]
+    assert json.loads(ifbench[0]["label"])["kwargs"] == [effective_kwargs]
 
 
 def test_new_schema_key_type_is_lossless_and_typed_key_is_unique() -> None:

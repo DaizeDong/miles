@@ -1427,7 +1427,16 @@ def _normalize_new_contract(
         )
     if any(not isinstance(item, dict) for item in kwargs):
         raise ValidationError(f"{source.name}[{index}]: every kwargs item must be an object")
-    return copy.deepcopy(record_id), prompt, list(instruction_ids), copy.deepcopy(kwargs)
+    # Arrow/Parquet widens a list-of-struct column to the union of every
+    # observed field, materializing unrelated fields as explicit nulls.  The
+    # pinned IFBench strict evaluator removes those nulls before dispatch,
+    # while its loose evaluator does not.  Persist the effective official
+    # contract so strict and loose evaluate the same instruction arguments.
+    sanitized_kwargs = [
+        {key: copy.deepcopy(value) for key, value in item.items() if value is not None}
+        for item in kwargs
+    ]
+    return copy.deepcopy(record_id), prompt, list(instruction_ids), sanitized_kwargs
 
 
 def _convert_new_ifeval(
@@ -2116,6 +2125,8 @@ def _validate_prepared_new(
             raise ValidationError(f"prepared {name} row {index}: invalid instruction ids")
         if not isinstance(kwargs, list) or len(kwargs) != len(ids) or any(not isinstance(x, dict) for x in kwargs):
             raise ValidationError(f"prepared {name} row {index}: invalid kwargs")
+        if any(value is None for item in kwargs for value in item.values()):
+            raise ValidationError(f"prepared {name} row {index}: kwargs contain explicit null fields")
         if row["label"] != _canonical({"instruction_id_list": ids, "kwargs": kwargs}):
             raise ValidationError(f"prepared {name} row {index}: label/metadata contract mismatch")
         source_key = metadata.get("source_key")

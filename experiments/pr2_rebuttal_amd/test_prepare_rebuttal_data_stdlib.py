@@ -140,6 +140,23 @@ class DataHardeningTests(unittest.TestCase):
                 verifier_schema=prep.GOOGLE_IFEVAL_SCHEMA,
             )
 
+    def test_new_schema_removes_only_explicit_null_struct_fields(self) -> None:
+        row = {
+            "key": 9,
+            "prompt": "one",
+            "instruction_id_list": ["a:b"],
+            "kwargs": [{"unused": None, "zero": 0, "empty": "", "keyword": "kept"}],
+        }
+        output = prep._convert_new_ifeval(
+            [row],
+            _source("ifbench_test"),
+            rm_type="ifbench",
+            verifier_schema=prep.IFBENCH_SCHEMA,
+        )
+        expected = {"zero": 0, "empty": "", "keyword": "kept"}
+        self.assertEqual(output[0]["metadata"]["kwargs"], [expected])
+        self.assertEqual(json.loads(output[0]["label"])["kwargs"], [expected])
+
     def test_normalized_leakage_is_hard_and_casefold_is_diagnostic(self) -> None:
         with self.assertRaisesRegex(prep.ValidationError, "prompt leakage"):
             prep._check_prompt_leakage_views(
@@ -206,6 +223,7 @@ class DataHardeningTests(unittest.TestCase):
             @staticmethod
             def test_instruction_following_strict(input_example, responses):
                 calls.append(("strict", id(input_example)))
+                self.assertNotIn("unused", input_example.kwargs[0])
                 input_example.kwargs[0]["strict_mutation"] = True
                 self.assertEqual(responses, {"prompt": "smoke response"})
                 return SimpleNamespace(
@@ -217,6 +235,7 @@ class DataHardeningTests(unittest.TestCase):
             @staticmethod
             def test_instruction_following_loose(input_example, responses):
                 calls.append(("loose", id(input_example)))
+                self.assertNotIn("unused", input_example.kwargs[0])
                 self.assertNotIn("strict_mutation", input_example.kwargs[0])
                 self.assertEqual(responses, {"prompt": "smoke response"})
                 return SimpleNamespace(
@@ -227,7 +246,7 @@ class DataHardeningTests(unittest.TestCase):
 
         row = {"metadata": {"record_id": 7, "prompt_text": "prompt"}}
         runtime_validator._official_strict_loose_smoke(
-            FakeEvaluationLib, row, "constraint:id", {"N": 1}
+            FakeEvaluationLib, row, "constraint:id", {"N": 1, "unused": None}
         )
         self.assertEqual([mode for mode, _ in calls], ["strict", "loose"])
         self.assertNotEqual(calls[0][1], calls[1][1])
