@@ -40,6 +40,56 @@ class TestCustomEvalMetricsContract:
         with pytest.raises(TypeError, match="dict, bool, or None"):
             metrics.log_eval_rollout_data(1, self._args(), {})
 
+    def test_mapping_rewards_use_eval_reward_key_for_sample_metrics(self, monkeypatch):
+        """Exercise the real eval logger path used by mapping-valued custom RMs."""
+        args = make_args(
+            advantage_estimator="grpo",
+            reward_key=None,
+            eval_reward_key="score",
+            n_samples_per_eval_prompt=2,
+        )
+        samples = make_samples_grouped(2, 2, rewards=[1.0, 1.0, 0.0, 0.0])
+        for sample in samples:
+            sample.reward = {"score": sample.reward}
+
+        monkeypatch.setattr(metrics, "compute_rollout_step", lambda _args, rollout_id: rollout_id)
+        monkeypatch.setattr(metrics.tracking_utils, "log", lambda *_args, **_kwargs: None)
+        result = metrics.log_eval_rollout_data(
+            4,
+            args,
+            {
+                "math": {
+                    "rewards": [1.0, 1.0, 0.0, 0.0],
+                    "samples": samples,
+                }
+            },
+        )
+
+        assert result["eval/math"] == 0.5
+        assert result["eval/math/zero_std/count_1.0"] == 1
+        assert result["eval/math/zero_std/count_0.0"] == 1
+        assert result["eval/math/zero_std/all_one_percentage"] == 0.5
+        assert result["eval/math/zero_std/all_zero_percentage"] == 0.5
+
+    def test_mapping_rewards_fail_closed_when_eval_key_is_missing(self, monkeypatch):
+        args = make_args(
+            advantage_estimator="grpo",
+            reward_key=None,
+            eval_reward_key="score",
+            n_samples_per_eval_prompt=1,
+        )
+        samples = make_samples_grouped(1, 1, rewards=[1.0])
+        samples[0].reward = {"other": 1.0}
+
+        monkeypatch.setattr(metrics, "compute_rollout_step", lambda _args, rollout_id: rollout_id)
+        monkeypatch.setattr(metrics.tracking_utils, "log", lambda *_args, **_kwargs: None)
+        with pytest.raises(KeyError, match="score"):
+            metrics.log_eval_rollout_data(
+                5,
+                args,
+                {"math": {"rewards": [1.0], "samples": samples}},
+            )
+
 
 class TestComputeZeroStdMetrics:
     def test_returns_empty_for_ppo_regardless_of_reward_distribution(self):

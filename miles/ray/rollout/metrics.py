@@ -40,7 +40,14 @@ def log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] 
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
-            log_dict |= dict_add_prefix(_compute_metrics_from_samples(args, samples), f"eval/{key}/")
+            # Evaluation may select a different field from a mapping reward
+            # than training.  Keep diagnostics in the same scalar domain as
+            # the aggregate eval reward above.
+            reward_key = args.eval_reward_key or args.reward_key
+            log_dict |= dict_add_prefix(
+                _compute_metrics_from_samples(args, samples, reward_key=reward_key),
+                f"eval/{key}/",
+            )
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
@@ -80,12 +87,12 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
     tracking_utils.log(args, log_dict, step_key="rollout/step")
 
 
-def _compute_metrics_from_samples(args, samples):
+def _compute_metrics_from_samples(args, samples, *, reward_key: str | None = None):
     response_lengths = [sample.effective_response_length for sample in samples]
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
-    log_dict |= _compute_zero_std_metrics(args, samples)
+    log_dict |= _compute_zero_std_metrics(args, samples, reward_key=reward_key)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
@@ -153,19 +160,24 @@ def _compute_perf_metrics_from_samples(args, samples, rollout_time):
     return log_dict
 
 
-def _compute_zero_std_metrics(args, all_samples: list[Sample]):
+def _compute_zero_std_metrics(args, all_samples: list[Sample], *, reward_key: str | None = None):
     # only compute in GRPO-like algorithms where one prompt has multiple responses
     if args.advantage_estimator == "ppo":
         return {}
 
+    def _reward_value(sample: Sample):
+        if reward_key is None:
+            return sample.get_reward_value(args)
+        return sample.reward[reward_key]
+
     def _is_zero_std(samples: list[Sample]):
-        rewards = [sample.get_reward_value(args) for sample in samples]
+        rewards = [_reward_value(sample) for sample in samples]
         return len(rewards) == 0 or all(rewards[0] == r for r in rewards)
 
     all_sample_groups = group_by(all_samples, lambda s: s.group_index)
     interesting_sample_groups = [g for g in all_sample_groups.values() if _is_zero_std(g)]
 
-    interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
+    interesting_rewards = [str(round(_reward_value(g[0]), 1)) for g in interesting_sample_groups]
 
     counts = {reward: len(items) for reward, items in group_by(interesting_rewards).items()}
     log_dict = {f"zero_std/count_{reward}": count for reward, count in counts.items()}
