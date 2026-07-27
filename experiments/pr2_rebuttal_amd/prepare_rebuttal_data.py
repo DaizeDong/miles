@@ -32,6 +32,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 import zipfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -83,6 +84,8 @@ GOOGLE_IFEVAL_SCHEMA = "open_instruct.IFEvalG.instruction_id_list_kwargs.v1"
 IFBENCH_SCHEMA = "ifbench.instruction_id_list_kwargs.v1"
 MATH_SCHEMA = "miles.math.boxed_equivalence.v1"
 GSM8K_SCHEMA = "verl.gsm8k.final_hash_answer.v1"
+IF_MULTI_EXPECTED_DUPLICATE_SOURCE_KEY_VALUES = 4
+IF_MULTI_EXPECTED_DUPLICATE_SOURCE_KEY_ROWS = 5
 
 MATH_PROMPT_PREFIX = (
     "Solve the following math problem step by step. The last line of your response "
@@ -1221,7 +1224,6 @@ def _convert_if_multi(rows: list[dict[str, Any]], source: FileSource) -> list[di
     """Preserve the one-element IFEvalG contract used by the gated fallback."""
 
     converted: list[dict[str, Any]] = []
-    seen_keys: set[str] = set()
     for index, row in enumerate(rows):
         if set(row) != IF_MULTI_SOURCE_KEYS:
             raise ValidationError(
@@ -1259,10 +1261,6 @@ def _convert_if_multi(rows: list[dict[str, Any]], source: FileSource) -> list[di
             raise ValidationError(f"{source.name}[{index}]: kwargs entries must be objects or null")
         if not isinstance(row["key"], str) or not row["key"]:
             raise ValidationError(f"{source.name}[{index}]: key must be non-empty text")
-        typed_key = _canonical({"type": "str", "value": row["key"]})
-        if typed_key in seen_keys:
-            raise ValidationError(f"{source.name}[{index}]: duplicate source key {row['key']!r}")
-        seen_keys.add(typed_key)
         for field in ("dataset", "constraint_type", "constraint"):
             if not isinstance(row[field], str) or not row[field]:
                 raise ValidationError(f"{source.name}[{index}]: {field} must be non-empty text")
@@ -1296,6 +1294,23 @@ def _convert_if_multi(rows: list[dict[str, Any]], source: FileSource) -> list[di
             }
         )
     return converted
+
+
+def _source_key_duplicate_metrics(
+    rows: list[dict[str, Any]], dataset: str
+) -> dict[str, int]:
+    """Count non-unique source labels without treating them as record IDs."""
+
+    counts: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        key = row.get("key")
+        if not isinstance(key, str) or not key:
+            raise ValidationError(f"{dataset}[{index}]: key must be non-empty text")
+        counts[key] = counts.get(key, 0) + 1
+    return {
+        "source_key_duplicate_values": sum(count > 1 for count in counts.values()),
+        "source_key_duplicate_rows": sum(max(0, count - 1) for count in counts.values()),
+    }
 
 
 def _consolidate_if_multi_prompts(
@@ -1685,6 +1700,8 @@ def _dataset_manifest_entry(
         "bytes": output_info["bytes"],
         "physical_rows_per_prompt": 1,
         "rollout_preexpanded": False,
+        "source_key_duplicate_values": 0,
+        "source_key_duplicate_rows": 0,
     }
     entry.update(
         prompt_consolidation
@@ -1733,6 +1750,18 @@ def _prepare_one_dataset(
         output_info,
         prompt_consolidation,
     )
+    if source.name == "if_multi_fallback_train":
+        source_key_metrics = _source_key_duplicate_metrics(unique_raw, source.name)
+        expected_source_key_metrics = {
+            "source_key_duplicate_values": IF_MULTI_EXPECTED_DUPLICATE_SOURCE_KEY_VALUES,
+            "source_key_duplicate_rows": IF_MULTI_EXPECTED_DUPLICATE_SOURCE_KEY_ROWS,
+        }
+        if source_key_metrics != expected_source_key_metrics:
+            raise ValidationError(
+                f"{source.name}: source-key reuse differs from the pinned upstream contract: "
+                f"got={source_key_metrics}, expected={expected_source_key_metrics}"
+            )
+        entry.update(source_key_metrics)
     return entry, prompts
 
 
@@ -2006,6 +2035,8 @@ def _validate_prepared_old(rows: list[dict[str, Any]], expected: dict[str, Any])
 def _validate_prepared_if_multi(rows: list[dict[str, Any]], expected: dict[str, Any]) -> set[str]:
     name = "prepared.if_multi_fallback_train"
     prompts = _ensure_unique_prompts(rows, name)
+    all_source_keys: list[str] = []
+    all_source_indices: list[int] = []
     for index, row in enumerate(rows):
         _require_fields(row, {"prompt", "label", "metadata"}, name, index)
         metadata = row["metadata"]
@@ -2040,12 +2071,25 @@ def _validate_prepared_if_multi(rows: list[dict[str, Any]], expected: dict[str, 
         source_indices = metadata.get("source_row_indices", [metadata.get("source_row_index")])
         if not isinstance(source_keys, list) or not source_keys or len(source_keys) != len(source_indices):
             raise ValidationError(f"{name}[{index}]: consolidation provenance mismatch")
-        if len({_canonical({"type": type(key).__name__, "value": key}) for key in source_keys}) != len(
-            source_keys
-        ):
-            raise ValidationError(f"{name}[{index}]: duplicate source key in consolidation provenance")
+        if any(not isinstance(key, str) or not key for key in source_keys):
+            raise ValidationError(f"{name}[{index}]: invalid source key in consolidation provenance")
+        if any(not isinstance(value, int) or isinstance(value, bool) for value in source_indices):
+            raise ValidationError(f"{name}[{index}]: invalid source row index in consolidation provenance")
+        all_source_keys.extend(source_keys)
+        all_source_indices.extend(source_indices)
     if len(rows) != expected["output_rows"]:
         raise ValidationError("prepared IF_multi row count differs from manifest")
+    if len(set(all_source_indices)) != len(all_source_indices):
+        raise ValidationError("prepared IF_multi source row indices are not unique")
+    if len(all_source_indices) != expected["raw_rows"] - expected["exact_raw_record_duplicates_removed"]:
+        raise ValidationError("prepared IF_multi provenance does not account for every unique raw row")
+    key_counts = Counter(all_source_keys)
+    recomputed_key_metrics = {
+        "source_key_duplicate_values": sum(count > 1 for count in key_counts.values()),
+        "source_key_duplicate_rows": sum(max(0, count - 1) for count in key_counts.values()),
+    }
+    if any(expected.get(key) != value for key, value in recomputed_key_metrics.items()):
+        raise ValidationError("prepared IF_multi source-key reuse differs from manifest")
     return prompts
 
 
@@ -2409,6 +2453,8 @@ def verify_dataset_bundle(output_root: Path) -> dict[str, Any]:
             "prompt_identical_contract_duplicates_removed",
             "prompt_contract_consolidation_groups",
             "constraints_deduplicated_during_consolidation",
+            "source_key_duplicate_values",
+            "source_key_duplicate_rows",
         )
         if any(not isinstance(record.get(metric), int) or record[metric] < 0 for metric in integer_metrics):
             raise ValidationError(f"dataset {name} has malformed deduplication metrics")
@@ -2432,6 +2478,8 @@ def verify_dataset_bundle(output_root: Path) -> dict[str, Any]:
                 "prompt_identical_contract_duplicates_removed",
                 "prompt_contract_consolidation_groups",
                 "constraints_deduplicated_during_consolidation",
+                "source_key_duplicate_values",
+                "source_key_duplicate_rows",
             )
         ):
             raise ValidationError(f"dataset {name} unexpectedly consolidated prompt records")

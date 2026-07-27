@@ -75,6 +75,29 @@ def test_if_multi_requires_exact_source_and_contract_keys() -> None:
         prep._convert_if_multi([row], _source("if_multi_fallback_train"))
 
 
+def test_if_multi_source_key_is_a_reusable_label_not_record_identity() -> None:
+    first = {
+        "key": "reused",
+        "messages": [{"role": "user", "content": "first prompt"}],
+        "ground_truth": "[{'instruction_id':['a:b'],'kwargs':[{}]}]",
+        "dataset": "ifeval",
+        "constraint_type": "one",
+        "constraint": "first constraint",
+    }
+    second = {
+        **first,
+        "messages": [{"role": "user", "content": "second prompt"}],
+        "ground_truth": "[{'instruction_id':['c:d'],'kwargs':[{}]}]",
+        "constraint": "second constraint",
+    }
+    converted = prep._convert_if_multi(
+        [first, second], _source("if_multi_fallback_train")
+    )
+    assert len(converted) == 2
+    assert converted[0]["metadata"]["source_key"] == converted[1]["metadata"]["source_key"]
+    assert converted[0]["metadata"]["source_row_index"] != converted[1]["metadata"]["source_row_index"]
+
+
 def test_if_multi_prompt_contracts_are_deterministically_consolidated() -> None:
     base = {
         "messages": [{"role": "user", "content": "same prompt"}],

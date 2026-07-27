@@ -105,6 +105,20 @@ class DataHardeningTests(unittest.TestCase):
         with self.assertRaisesRegex(prep.ValidationError, "exact source keys"):
             prep._convert_if_multi([row], _source("if_multi_fallback_train"))
 
+    def test_if_multi_reused_source_labels_preserve_distinct_prompts(self) -> None:
+        first = self._if_multi_row("reused", "[{'instruction_id':['a:b'],'kwargs':[{}]}]")
+        second = self._if_multi_row("reused", "[{'instruction_id':['c:d'],'kwargs':[{}]}]")
+        second["messages"] = [{"role": "user", "content": "different prompt"}]
+        converted = prep._convert_if_multi(
+            [first, second], _source("if_multi_fallback_train")
+        )
+        self.assertEqual(len(converted), 2)
+        self.assertNotEqual(converted[0]["prompt"], converted[1]["prompt"])
+        self.assertEqual(
+            prep._source_key_duplicate_metrics([first, second], "if_multi"),
+            {"source_key_duplicate_values": 1, "source_key_duplicate_rows": 1},
+        )
+
     def test_new_key_type_is_preserved_and_unique(self) -> None:
         rows = [
             {"key": 1, "prompt": "one", "instruction_id_list": ["a:b"], "kwargs": [{}]},
