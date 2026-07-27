@@ -35,10 +35,22 @@ _PROTOCOL_DATASET_SETS = {
     frozenset(("gsm8k", "math500")): "math",
     frozenset(("google_ifeval", "ifbench_test")): "nonmath",
 }
+_FRACTIONAL_REWARD_RM_TYPES = frozenset(("ifevalg",))
 
 
-def dataset_reward_metrics(rewards: Iterable[float], group_size: int) -> dict[str, float]:
-    """Return sample-average accuracy and unbiased pass@{1,2,4,...}."""
+def dataset_reward_metrics(
+    rewards: Iterable[float],
+    group_size: int,
+    *,
+    allow_fractional: bool = False,
+) -> dict[str, float]:
+    """Return mean reward and, for binary groups, unbiased pass@k metrics.
+
+    Official IFEvalG scoring is a mean over the constraints attached to one
+    response, so its online diagnostic is legitimately fractional.  It is
+    only meaningful as an ``avg@1`` diagnostic here.  Binary math and strict
+    IFBench rewards retain the stronger validation required for pass@k.
+    """
 
     raw_values = list(rewards)
     if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in raw_values):
@@ -52,6 +64,12 @@ def dataset_reward_metrics(rewards: Iterable[float], group_size: int) -> dict[st
         )
     if not all(math.isfinite(value) for value in values):
         raise ValueError("evaluation rewards must be finite")
+    if allow_fractional:
+        if group_size != 1:
+            raise ValueError("fractional evaluation rewards require group_size=1")
+        if any(value < 0.0 or value > 1.0 for value in values):
+            raise ValueError("fractional evaluation rewards must lie in [0, 1]")
+        return {"avg@1": sum(values) / len(values)}
     if any(value not in (0.0, 1.0) for value in values):
         raise ValueError("formal rule-based evaluation rewards must be binary 0/1")
 
@@ -542,8 +560,12 @@ def log_eval_rollout_data(
         if not isinstance(group_size, int) or isinstance(group_size, bool) or group_size <= 0:
             raise ValueError(f"dataset {name} has invalid n_samples_per_eval_prompt={group_size!r}")
 
-        reward_metrics = dataset_reward_metrics(rewards, group_size)
         rm_type = _dataset_rm_type(samples)
+        reward_metrics = dataset_reward_metrics(
+            rewards,
+            group_size,
+            allow_fractional=rm_type in _FRACTIONAL_REWARD_RM_TYPES,
+        )
         if rm_type in {"ifevalg", "ifbench"}:
             if group_size != 1:
                 raise ValueError(f"official instruction-following protocol requires n=1, got {group_size}")

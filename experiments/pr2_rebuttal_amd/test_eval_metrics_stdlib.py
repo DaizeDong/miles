@@ -67,6 +67,25 @@ class FrozenEvalMetricsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "binary"):
             METRICS.dataset_reward_metrics([0.5], 1)
 
+    def test_fractional_constraint_mean_is_explicit_and_avg_only(self) -> None:
+        self.assertEqual(
+            METRICS.dataset_reward_metrics(
+                [0.5, 0.25], 1, allow_fractional=True
+            ),
+            {"avg@1": 0.375},
+        )
+        with self.assertRaisesRegex(ValueError, "group_size=1"):
+            METRICS.dataset_reward_metrics(
+                [0.5, 0.0], 2, allow_fractional=True
+            )
+        for invalid in (-0.1, 1.1):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, r"\[0, 1\]"
+            ):
+                METRICS.dataset_reward_metrics(
+                    [invalid], 1, allow_fractional=True
+                )
+
     def test_flattened_samples_require_exact_tag_rm_type_and_n(self) -> None:
         configs = {
             "gsm8k": SimpleNamespace(n_samples_per_eval_prompt=1),
@@ -153,6 +172,115 @@ class FrozenEvalMetricsTest(unittest.TestCase):
                 with self.assertRaises(FileExistsError):
                     METRICS.log_eval_rollout_data(233, args, data)
                 artifact_dir.chmod(0o755)
+
+    def test_hook_keeps_fractional_ifevalg_diagnostic_separate_from_official_primary(self) -> None:
+        google = [sample("google_ifeval", "ifevalg", 0, 0, 0.5)]
+        ifbench = [sample("ifbench_test", "ifbench", 0, 0, 1.0)]
+        for record_id, item in enumerate((*google, *ifbench)):
+            item.metadata.update(
+                record_id=record_id,
+                prompt_text=f"prompt-{record_id}",
+                instruction_id_list=["constraint-a", "constraint-b"],
+                kwargs=[{}, {}],
+            )
+        configs = [
+            SimpleNamespace(name="google_ifeval", n_samples_per_eval_prompt=1),
+            SimpleNamespace(name="ifbench_test", n_samples_per_eval_prompt=1),
+        ]
+        args = SimpleNamespace(eval_datasets=configs)
+        data = {
+            "google_ifeval": {
+                "rewards": [0.5],
+                "samples": google,
+                "truncated": [False],
+            },
+            "ifbench_test": {
+                "rewards": [1.0],
+                "samples": ifbench,
+                "truncated": [False],
+            },
+        }
+
+        def official_outputs(_samples, rm_type):
+            if rm_type == "ifevalg":
+                strict_decisions = [True, False]
+                loose_decisions = [True, True]
+            else:
+                strict_decisions = loose_decisions = [True, True]
+
+            def output(decisions):
+                return SimpleNamespace(
+                    follow_instruction_list=decisions,
+                    instruction_id_list=["constraint-a", "constraint-b"],
+                    follow_all_instructions=all(decisions),
+                )
+
+            return [output(strict_decisions)], [output(loose_decisions)]
+
+        rollout_metrics = types.ModuleType("miles.ray.rollout.metrics")
+        rollout_metrics._compute_metrics_from_samples = lambda _args, _samples: {}
+        utils = types.ModuleType("miles.utils")
+        tracking = types.ModuleType("miles.utils.tracking_utils")
+        tracking.log = lambda *_args, **_kwargs: None
+        utils.tracking_utils = tracking
+        metric_utils = types.ModuleType("miles.utils.metric_utils")
+        metric_utils.compute_rollout_step = lambda _args, rollout_id: rollout_id
+        metric_utils.dict_add_prefix = lambda values, prefix: {
+            f"{prefix}{key}": value for key, value in values.items()
+        }
+        fake_modules = {
+            "miles": types.ModuleType("miles"),
+            "miles.ray": types.ModuleType("miles.ray"),
+            "miles.ray.rollout": types.ModuleType("miles.ray.rollout"),
+            "miles.ray.rollout.metrics": rollout_metrics,
+            "miles.utils": utils,
+            "miles.utils.tracking_utils": tracking,
+            "miles.utils.metric_utils": metric_utils,
+        }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            save_root = Path(temporary) / "run"
+            with (
+                mock.patch.dict(sys.modules, fake_modules),
+                mock.patch.dict(os.environ, {"TENSORBOARD_DIR": str(save_root / "tensorboard")}),
+                mock.patch.object(
+                    METRICS,
+                    "_load_manifest_contract",
+                    return_value=(
+                        {
+                            "google_ifeval": {"artifact_rows": 1},
+                            "ifbench_test": {"artifact_rows": 1},
+                        },
+                        {"eval_config_sha256": "a" * 64},
+                    ),
+                ),
+                mock.patch.object(
+                    METRICS,
+                    "_load_saved_eval_samples",
+                    return_value=(
+                        {"google_ifeval": google, "ifbench_test": ifbench},
+                        {"raw_eval_sha256": "b" * 64},
+                    ),
+                ),
+                mock.patch.object(METRICS, "_official_outputs", side_effect=official_outputs),
+            ):
+                result = METRICS.log_eval_rollout_data(232, args, data)
+
+            self.assertEqual(result["eval/google_ifeval-online_reward"], 0.5)
+            self.assertEqual(result["eval/google_ifeval"], 1.0)
+            self.assertEqual(result["eval/google_ifeval-prompt_strict"], 0.0)
+            self.assertEqual(result["eval/google_ifeval-prompt_loose"], 1.0)
+            aggregate_path = save_root / "eval_artifacts" / "rollout-232" / "aggregate.json"
+            aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                aggregate["datasets"]["google_ifeval"]["online_reward_diagnostic"],
+                0.5,
+            )
+
+    def test_strict_ifbench_remains_binary_fail_closed(self) -> None:
+        self.assertNotIn("ifbench", METRICS._FRACTIONAL_REWARD_RM_TYPES)
+        with self.assertRaisesRegex(ValueError, "binary"):
+            METRICS.dataset_reward_metrics([0.5], 1)
 
 
 if __name__ == "__main__":
