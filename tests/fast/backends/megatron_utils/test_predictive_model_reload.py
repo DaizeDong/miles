@@ -53,6 +53,62 @@ def _gate_args(**overrides):
     return SimpleNamespace(**values)
 
 
+@pytest.mark.parametrize("raw_expected_step", [None, "", "   \t"])
+def test_optimizer_resume_probe_treats_missing_or_blank_expectation_as_disabled(
+    monkeypatch, raw_expected_step
+):
+    monkeypatch.setenv("PR2_VALIDATE", "1")
+    if raw_expected_step is None:
+        monkeypatch.delenv("PR2_EXPECT_RESUME_HDO_STEP", raising=False)
+    else:
+        monkeypatch.setenv("PR2_EXPECT_RESUME_HDO_STEP", raw_expected_step)
+    monkeypatch.setattr(
+        dist_ckpt_compat,
+        "_collect_local_optimizer_resume_record",
+        lambda *args, **kwargs: pytest.fail("disabled optimizer-resume probe must not inspect optimizer state"),
+    )
+
+    dist_ckpt_compat.maybe_validate_pr2_optimizer_resume(SimpleNamespace(), object(), 0)
+
+
+def test_optimizer_resume_probe_strips_and_validates_nonblank_expectation(monkeypatch):
+    monkeypatch.setenv("PR2_VALIDATE", "1")
+    monkeypatch.setenv("PR2_EXPECT_RESUME_HDO_STEP", " 8 \t")
+    monkeypatch.setenv("PR2_EXPECT_CHECKPOINT_ITERATION", "2")
+    monkeypatch.setenv("PR2_EXPECT_PREDICTOR_NUMEL", "3407872")
+    _install_single_rank_collectives(monkeypatch)
+    monkeypatch.setattr(
+        dist_ckpt_compat,
+        "_collect_local_optimizer_resume_record",
+        lambda *args, **kwargs: {
+            "rank": 0,
+            "iteration": 2,
+            "local_error": None,
+            "lrs": [3.75e-7, 1.875e-5, 3.75e-7],
+            "max_lrs": [3.75e-7, 1.875e-5, 3.75e-7],
+            "children": [
+                {
+                    "index": 0,
+                    "is_hdo": True,
+                    "state_count": 1,
+                    "missing_steps": False,
+                    "steps": [8.0],
+                    "missing_sub_steps": False,
+                    "sub_steps": [8.0],
+                }
+            ],
+            "predictor_group_count": 1,
+            "predictor_state_count": 1,
+            "predictor_numel": 3_407_872,
+            "exp_avg_abs_sum": 1.0,
+            "exp_avg_sq_abs_sum": 1.0,
+        },
+    )
+
+    args = SimpleNamespace(lr=3.75e-7, bias_predictor_lr_mult=50)
+    dist_ckpt_compat.maybe_validate_pr2_optimizer_resume(args, object(), 2)
+
+
 def test_model_reload_probe_is_noop_unless_explicitly_enabled(monkeypatch):
     monkeypatch.delenv("PR2_MODEL_ONLY_RELOAD_GATE", raising=False)
     monkeypatch.setattr(

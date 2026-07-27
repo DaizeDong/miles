@@ -244,10 +244,14 @@ def _collect_local_optimizer_resume_record(args, optimizer, iteration: int, pred
 def maybe_validate_pr2_optimizer_resume(args, optimizer, iteration: int) -> None:
     """Run the opt-in, distributed PR2 optimizer-resume acceptance probe."""
     raw_expected_step = os.environ.get("PR2_EXPECT_RESUME_HDO_STEP")
-    if os.environ.get("PR2_VALIDATE", "0") != "1" or raw_expected_step is None:
+    if (
+        os.environ.get("PR2_VALIDATE", "0") != "1"
+        or raw_expected_step is None
+        or not raw_expected_step.strip()
+    ):
         return
 
-    expected_step = float(raw_expected_step)
+    expected_step = float(raw_expected_step.strip())
     expected_iteration = int(os.environ.get("PR2_EXPECT_CHECKPOINT_ITERATION", iteration))
     expected_predictor_numel = int(os.environ.get("PR2_EXPECT_PREDICTOR_NUMEL", "0")) or None
     base_lr = float(args.lr)
