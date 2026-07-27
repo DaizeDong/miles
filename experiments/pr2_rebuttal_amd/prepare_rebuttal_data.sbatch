@@ -40,6 +40,8 @@ readonly IMAGE=docker.io/rlsys/miles@sha256:e60a69faa831ae2a146819290e8469cf23c8
 readonly OUTPUT_ROOT=${PR2_REBUTTAL_DATA_ROOT:-/home/daidong/rebuttal_workspace/data/pr2-rebuttal-one-copy-v1}
 readonly JOB_ID=${SPUR_JOB_ID:-${SLURM_JOB_ID:-}}
 readonly JOB_NODELIST=${SLURM_JOB_NODELIST:-${SPUR_JOB_NODELIST:-}}
+readonly HOST_UID=$(id -u)
+readonly HOST_GID=$(id -g)
 
 if [[ -z "${JOB_ID}" ]]; then
   echo "FATAL: this wrapper must run inside a SPUR/Slurm compute allocation" >&2
@@ -96,6 +98,7 @@ docker image inspect "${IMAGE}" --format 'image_id={{.Id}} repo_digests={{json .
 readonly CONTAINER_NAME=pr2-data-prep-${JOB_ID}
 docker run --rm \
   --name "${CONTAINER_NAME}" \
+  --user "${HOST_UID}:${HOST_GID}" \
   --network host \
   --cpus 8 \
   --memory 60g \
@@ -103,6 +106,7 @@ docker run --rm \
   --workdir "${REPO}" \
   --env PYTHONUNBUFFERED=1 \
   --env PYTHONDONTWRITEBYTECODE=1 \
+  --env HOME=/tmp \
   --env MILES_CONTAINER_IMAGE="${IMAGE}" \
   --env MILES_ROOT="${REPO}" \
   --env EXPECTED_CODE_SHA="${EXPECTED_CODE_SHA}" \
@@ -112,6 +116,27 @@ docker run --rm \
   --env SLURM_JOB_NODELIST="${SLURM_JOB_NODELIST:-}" \
   "${IMAGE}" \
   /bin/bash "${INNER_SCRIPT}" "${OUTPUT_ROOT}" ${MODE_FLAG:+"${MODE_FLAG}"}
+
+if [[ ! -r "${OUTPUT_ROOT}/manifest.json" ]]; then
+  echo "FATAL: published data manifest is not readable by the submitting user: ${OUTPUT_ROOT}" >&2
+  exit 101
+fi
+readonly FOREIGN_OWNER=$(find "${OUTPUT_ROOT}" -xdev \( ! -uid "${HOST_UID}" -o ! -gid "${HOST_GID}" \) -print -quit)
+if [[ -n "${FOREIGN_OWNER}" ]]; then
+  echo "FATAL: published data contains a foreign-owned path: ${FOREIGN_OWNER}" >&2
+  exit 102
+fi
+
+# The bundle is create-once and all runtime consumers are read-only. Preserve
+# existing execute bits while removing write bits from every entry, then prove
+# the manifest remains readable from the host account.
+find "${OUTPUT_ROOT}" -xdev -type f -exec chmod a-w -- {} +
+find "${OUTPUT_ROOT}" -xdev -type d -exec chmod a-w -- {} +
+[[ -r "${OUTPUT_ROOT}/manifest.json" ]] || {
+  echo "FATAL: frozen data manifest became unreadable: ${OUTPUT_ROOT}" >&2
+  exit 103
+}
+echo "DATA_PREP_OWNERSHIP=PASS uid=${HOST_UID} gid=${HOST_GID} immutable=1"
 
 echo "DATA_PREP_HOST_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "DATA_PREP_WRAPPER_RESULT=PASS"

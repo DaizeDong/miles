@@ -341,6 +341,9 @@ class DataHardeningTests(unittest.TestCase):
         self.assertIn("${MILES_ROOT:?", text)
         self.assertIn("${EXPECTED_CODE_SHA:?", text)
         self.assertIn("status --porcelain --untracked-files=all", text)
+        self.assertIn('--user "${HOST_UID}:${HOST_GID}"', text)
+        self.assertIn("DATA_PREP_OWNERSHIP=PASS", text)
+        self.assertIn("find \"${OUTPUT_ROOT}\" -xdev -type f -exec chmod a-w", text)
         self.assertNotIn("miles-pr1362-validation-fixed", text)
 
     def test_python_frozen_source_identity_is_recorded(self) -> None:
