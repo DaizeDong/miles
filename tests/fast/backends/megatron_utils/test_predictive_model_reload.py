@@ -21,6 +21,32 @@ def _stats(**overrides):
     return values
 
 
+def _optimizer_resume_record(step=8.0):
+    return {
+        "rank": 0,
+        "iteration": 2,
+        "local_error": None,
+        "lrs": [3.75e-7, 1.875e-5, 3.75e-7],
+        "max_lrs": [3.75e-7, 1.875e-5, 3.75e-7],
+        "children": [
+            {
+                "index": 0,
+                "is_hdo": True,
+                "state_count": 1,
+                "missing_steps": False,
+                "steps": [step],
+                "missing_sub_steps": False,
+                "sub_steps": [step],
+            }
+        ],
+        "predictor_group_count": 1,
+        "predictor_state_count": 1,
+        "predictor_numel": 3_407_872,
+        "exp_avg_abs_sum": 1.0,
+        "exp_avg_sq_abs_sum": 1.0,
+    }
+
+
 def _install_single_rank_collectives(monkeypatch):
     monkeypatch.setattr(dist_ckpt_compat.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(dist_ckpt_compat.dist, "get_world_size", lambda group=None: 1)
@@ -77,36 +103,39 @@ def test_optimizer_resume_probe_strips_and_validates_nonblank_expectation(monkey
     monkeypatch.setenv("PR2_EXPECT_CHECKPOINT_ITERATION", "2")
     monkeypatch.setenv("PR2_EXPECT_PREDICTOR_NUMEL", "3407872")
     _install_single_rank_collectives(monkeypatch)
+    collector_calls = []
+
+    def collect(*args, **kwargs):
+        collector_calls.append((args, kwargs))
+        return _optimizer_resume_record()
+
+    monkeypatch.setattr(dist_ckpt_compat, "_collect_local_optimizer_resume_record", collect)
+
+    args = SimpleNamespace(lr=3.75e-7, bias_predictor_lr_mult=50)
+    optimizer = object()
+    dist_ckpt_compat.maybe_validate_pr2_optimizer_resume(args, optimizer, 2)
+    assert len(collector_calls) == 1
+    positional, keyword = collector_calls[0]
+    assert keyword == {}
+    assert positional[:3] == (args, optimizer, 2)
+    assert positional[3] == pytest.approx(1.875e-5)
+
+
+def test_optimizer_resume_probe_strictly_rejects_step_mismatch(monkeypatch):
+    monkeypatch.setenv("PR2_VALIDATE", "1")
+    monkeypatch.setenv("PR2_EXPECT_RESUME_HDO_STEP", "9")
+    monkeypatch.setenv("PR2_EXPECT_CHECKPOINT_ITERATION", "2")
+    monkeypatch.setenv("PR2_EXPECT_PREDICTOR_NUMEL", "3407872")
+    _install_single_rank_collectives(monkeypatch)
     monkeypatch.setattr(
         dist_ckpt_compat,
         "_collect_local_optimizer_resume_record",
-        lambda *args, **kwargs: {
-            "rank": 0,
-            "iteration": 2,
-            "local_error": None,
-            "lrs": [3.75e-7, 1.875e-5, 3.75e-7],
-            "max_lrs": [3.75e-7, 1.875e-5, 3.75e-7],
-            "children": [
-                {
-                    "index": 0,
-                    "is_hdo": True,
-                    "state_count": 1,
-                    "missing_steps": False,
-                    "steps": [8.0],
-                    "missing_sub_steps": False,
-                    "sub_steps": [8.0],
-                }
-            ],
-            "predictor_group_count": 1,
-            "predictor_state_count": 1,
-            "predictor_numel": 3_407_872,
-            "exp_avg_abs_sum": 1.0,
-            "exp_avg_sq_abs_sum": 1.0,
-        },
+        lambda *args, **kwargs: _optimizer_resume_record(step=8.0),
     )
 
     args = SimpleNamespace(lr=3.75e-7, bias_predictor_lr_mult=50)
-    dist_ckpt_compat.maybe_validate_pr2_optimizer_resume(args, object(), 2)
+    with pytest.raises(RuntimeError, match=r"steps=\[8\.0\]"):
+        dist_ckpt_compat.maybe_validate_pr2_optimizer_resume(args, object(), 2)
 
 
 def test_model_reload_probe_is_noop_unless_explicitly_enabled(monkeypatch):
