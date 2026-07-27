@@ -48,7 +48,11 @@ from .ci_utils import (
     compute_model_hashes_by_layer,
     save_model_hashes,
 )
-from .dist_ckpt_compat import install_dp_reshardable_hdo_step_compat, maybe_validate_pr2_optimizer_resume
+from .dist_ckpt_compat import (
+    install_dp_reshardable_hdo_step_compat,
+    maybe_validate_pr2_model_reload,
+    maybe_validate_pr2_optimizer_resume,
+)
 from .initialize import is_megatron_main_rank
 from .lora_utils import is_lora_enabled, is_lora_model
 from .model_provider import get_model_provider_func
@@ -1239,6 +1243,7 @@ def initialize_model_and_optimizer(
 
     opt_param_scheduler.step(increment=iteration * args.global_batch_size)
     if role == "actor":
+        maybe_validate_pr2_model_reload(args, model, iteration)
         maybe_validate_pr2_optimizer_resume(args, optimizer, iteration)
 
     return model, optimizer, opt_param_scheduler, iteration

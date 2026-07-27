@@ -287,13 +287,17 @@ def predictive_debug_param_stats_enabled() -> bool:
     return os.getenv("PREDICTIVE_DEBUG_PARAM_STATS", "0") == "1"
 
 
-def collect_predictive_param_stats(model_chunks) -> dict[str, float | int]:
+def collect_predictive_param_stats(model_chunks) -> dict[str, float | int | bool]:
     from megatron.core.transformer.moe.router import TopKRouter
 
-    stats: dict[str, float | int] = {
+    stats: dict[str, float | int | bool] = {
         "num_predictor_params": 0,
+        "num_nonzero_predictor_params": 0,
+        "predictor_numel": 0,
         "num_predictor_params_with_grad": 0,
         "num_predictor_params_with_main_grad": 0,
+        "all_weights_finite": True,
+        "weight_sum": 0.0,
         "weight_abs_sum": 0.0,
         "grad_abs_sum": 0.0,
         "main_grad_abs_sum": 0.0,
@@ -322,6 +326,13 @@ def collect_predictive_param_stats(model_chunks) -> dict[str, float | int]:
                 seen_params.add(id(param))
                 stats["num_predictor_params"] += 1
                 detached_param = param.detach()
+                stats["predictor_numel"] += detached_param.numel()
+                if bool(torch.count_nonzero(detached_param).item()):
+                    stats["num_nonzero_predictor_params"] += 1
+                stats["all_weights_finite"] = bool(stats["all_weights_finite"]) and bool(
+                    torch.isfinite(detached_param).all().item()
+                )
+                stats["weight_sum"] += float(detached_param.float().sum().item())
                 weight_abs = float(detached_param.abs().sum().item())
                 stats["weight_abs_sum"] += weight_abs
                 stats["max_weight_abs"] = max(float(stats["max_weight_abs"]), float(detached_param.abs().max().item()))

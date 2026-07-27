@@ -352,3 +352,128 @@ def maybe_validate_pr2_optimizer_resume(args, optimizer, iteration: int) -> None
     dist.broadcast_object_list(result, src=0, group=gloo_group)
     if result[0] is not None:
         raise RuntimeError(f"[PR2_VALIDATE] optimizer resume validation failed: {result[0]}")
+
+
+def maybe_validate_pr2_model_reload(args, model, iteration: int) -> None:
+    """Validate the predictor model tensors after a model-only checkpoint reload.
+
+    This probe is deliberately independent of optimizer state: the rebuttal
+    model-only gate uses ``--no-load-optim`` and therefore cannot reuse the
+    optimizer-resume acceptance check above.  The frozen Moonlight topology
+    keeps a complete copy of every router predictor on each rank, so each rank
+    must independently match the audited parameter count and contain finite,
+    non-zero loaded weights.
+    """
+
+    if os.environ.get("PR2_MODEL_ONLY_RELOAD_GATE", "0") != "1":
+        return
+    if os.environ.get("PR2_VALIDATE", "0") != "1":
+        raise RuntimeError("PR2 model-only reload validation requires PR2_VALIDATE=1")
+    if (
+        int(getattr(args, "tensor_model_parallel_size", 0)) != 1
+        or int(getattr(args, "pipeline_model_parallel_size", 0)) != 1
+    ):
+        raise RuntimeError("PR2 model-only reload validation requires tensor/pipeline parallel size 1")
+
+    raw_expected_numel = os.environ.get("PR2_EXPECT_PREDICTOR_NUMEL")
+    if raw_expected_numel is None:
+        raise RuntimeError("PR2 model-only reload validation requires PR2_EXPECT_PREDICTOR_NUMEL")
+    try:
+        expected_predictor_numel = int(raw_expected_numel)
+    except ValueError as exc:
+        raise RuntimeError("PR2_EXPECT_PREDICTOR_NUMEL must be a positive integer") from exc
+    if expected_predictor_numel <= 0:
+        raise RuntimeError("PR2_EXPECT_PREDICTOR_NUMEL must be a positive integer")
+
+    raw_expected_iteration = os.environ.get("PR2_EXPECT_CHECKPOINT_ITERATION")
+    if raw_expected_iteration is None:
+        raise RuntimeError("PR2 model-only reload validation requires PR2_EXPECT_CHECKPOINT_ITERATION")
+    try:
+        expected_iteration = int(raw_expected_iteration)
+    except ValueError as exc:
+        raise RuntimeError("PR2_EXPECT_CHECKPOINT_ITERATION must be a positive integer") from exc
+    if expected_iteration <= 0:
+        raise RuntimeError("PR2_EXPECT_CHECKPOINT_ITERATION must be a positive integer")
+
+    try:
+        from .predictive_router_replay import collect_predictive_param_stats
+
+        stats = collect_predictive_param_stats(model)
+        local_record = {
+            "rank": dist.get_rank(),
+            "iteration": iteration,
+            "local_error": None,
+            "num_predictor_params": int(stats["num_predictor_params"]),
+            "num_nonzero_predictor_params": int(stats["num_nonzero_predictor_params"]),
+            "predictor_numel": int(stats["predictor_numel"]),
+            "all_weights_finite": bool(stats["all_weights_finite"]),
+            "weight_sum": float(stats["weight_sum"]),
+            "weight_abs_sum": float(stats["weight_abs_sum"]),
+            "weight_l2_norm": float(stats["weight_l2_norm"]),
+        }
+    except Exception as exc:
+        # All ranks must still enter the collective so one malformed shard does
+        # not strand the rest of the allocation.
+        local_record = {
+            "rank": dist.get_rank(),
+            "iteration": iteration,
+            "local_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    from miles.utils.distributed_utils import get_gloo_group
+
+    gloo_group = get_gloo_group()
+    records = [None] * dist.get_world_size(group=gloo_group)
+    dist.all_gather_object(records, local_record, group=gloo_group)
+
+    error = None
+    if dist.get_rank() == 0:
+        errors = []
+        for record in records:
+            if record["local_error"] is not None:
+                errors.append(f"rank {record['rank']} local probe failed: {record['local_error']}")
+                continue
+            if record["iteration"] != expected_iteration:
+                errors.append(
+                    f"rank {record['rank']} iteration={record['iteration']}, expected={expected_iteration}"
+                )
+            if record["predictor_numel"] != expected_predictor_numel:
+                errors.append(
+                    f"rank {record['rank']} predictor_numel={record['predictor_numel']}, "
+                    f"expected={expected_predictor_numel}"
+                )
+            if record["num_predictor_params"] <= 0:
+                errors.append(f"rank {record['rank']} has no predictor parameter tensors")
+            if record["num_nonzero_predictor_params"] != record["num_predictor_params"]:
+                errors.append(
+                    f"rank {record['rank']} nonzero predictor tensors="
+                    f"{record['num_nonzero_predictor_params']}/{record['num_predictor_params']}"
+                )
+            checksums = (
+                record["weight_sum"],
+                record["weight_abs_sum"],
+                record["weight_l2_norm"],
+            )
+            if not record["all_weights_finite"] or not all(math.isfinite(value) for value in checksums):
+                errors.append(f"rank {record['rank']} predictor weights/checksums are non-finite")
+            if record["weight_abs_sum"] <= 0.0 or record["weight_l2_norm"] <= 0.0:
+                errors.append(f"rank {record['rank']} predictor weights are all zero")
+
+        valid_records = [record for record in records if record["local_error"] is None]
+        logger.info(
+            "[PR2_VALIDATE] model_reload iteration=%s expected_iteration=%s "
+            "expected_predictor_numel=%s rank_records=%s full=%s errors=%s",
+            iteration,
+            expected_iteration,
+            expected_predictor_numel,
+            valid_records,
+            not errors,
+            errors,
+        )
+        if errors:
+            error = "; ".join(errors)
+
+    result = [error]
+    dist.broadcast_object_list(result, src=0, group=gloo_group)
+    if result[0] is not None:
+        raise RuntimeError(f"[PR2_VALIDATE] model-only reload validation failed: {result[0]}")
