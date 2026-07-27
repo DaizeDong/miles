@@ -25,10 +25,12 @@ import multiprocessing
 import socket
 import threading
 import time
-from unittest.mock import patch
+from unittest.mock import AsyncMock, call, patch
 
+import httpx
 import pytest
 
+from miles.utils import http_utils
 from miles.utils.http_utils import wait_for_server_ready
 
 
@@ -194,3 +196,56 @@ class TestWaitForServerReadySimulatedDelays:
 
         # The fake clock should have advanced past the timeout
         assert fake_time[0] >= timeout
+
+
+class TestGet:
+    @pytest.mark.asyncio
+    async def test_retries_transient_remote_protocol_error(self, monkeypatch):
+        url = "http://rollout-router/workers"
+        request = httpx.Request("GET", url)
+        transient_error = httpx.RemoteProtocolError("peer disconnected", request=request)
+        response = httpx.Response(200, json={"workers": ["worker-0"]}, request=request)
+        client = AsyncMock()
+        client.get.side_effect = [transient_error, response]
+        sleep = AsyncMock()
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        monkeypatch.setattr(http_utils.asyncio, "sleep", sleep)
+
+        result = await http_utils.get(url, max_retries=2)
+
+        assert result == {"workers": ["worker-0"]}
+        assert client.get.await_args_list == [call(url, headers=None), call(url, headers=None)]
+        sleep.assert_awaited_once_with(1)
+
+    @pytest.mark.asyncio
+    async def test_propagates_remote_protocol_error_after_max_retries(self, monkeypatch):
+        url = "http://rollout-router/workers"
+        request = httpx.Request("GET", url)
+        transport_error = httpx.RemoteProtocolError("peer disconnected", request=request)
+        client = AsyncMock()
+        client.get.side_effect = transport_error
+        sleep = AsyncMock()
+        monkeypatch.setattr(http_utils, "_http_client", client)
+        monkeypatch.setattr(http_utils.asyncio, "sleep", sleep)
+
+        with pytest.raises(httpx.RemoteProtocolError) as exc_info:
+            await http_utils.get(url, max_retries=3)
+
+        assert exc_info.value is transport_error
+        assert client.get.await_count == 3
+        assert sleep.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_returns_json_and_forwards_headers(self, monkeypatch):
+        url = "http://rollout-router/workers"
+        headers = {"Authorization": "Bearer test-token", "X-Weight-Version": "7"}
+        request = httpx.Request("GET", url, headers=headers)
+        response = httpx.Response(200, json={"version": 7}, request=request)
+        client = AsyncMock()
+        client.get.return_value = response
+        monkeypatch.setattr(http_utils, "_http_client", client)
+
+        result = await http_utils.get(url, max_retries=1, headers=headers)
+
+        assert result == {"version": 7}
+        client.get.assert_awaited_once_with(url, headers=headers)

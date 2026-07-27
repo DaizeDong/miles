@@ -307,9 +307,6 @@ async def post(url, payload, max_retries=60, action="post", headers=None):
     return await _post(_http_client, url, payload, max_retries, action=action, headers=headers)
 
 
-# TODO unify w/ `post` to add retries and remote-execution
-async def get(url):
-    response = await _http_client.get(url)
-    response.raise_for_status()
-    output = response.json()
-    return output
+async def get(url, max_retries=60, headers=None):
+    """Issue a GET through the same fail-closed retry path as other HTTP actions."""
+    return await _post(_http_client, url, None, max_retries, action="get", headers=headers)
