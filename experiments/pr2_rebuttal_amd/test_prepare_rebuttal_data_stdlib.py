@@ -146,17 +146,33 @@ class DataHardeningTests(unittest.TestCase):
         lock_path = Path(prep.__file__).with_name("verifier_requirements.lock")
         locked = prep._parse_requirements_lock(lock_path)
         self.assertEqual(
-            set(locked),
-            {"emoji", "immutabledict", "langdetect", "nltk", "syllapy", "unicodedata2"},
+            set(locked), {"emoji", "immutabledict", "langdetect", "nltk", "syllapy"}
         )
         self.assertEqual(locked["nltk"], "3.9.4")
-        self.assertEqual(locked["unicodedata2"], "17.0.1")
         hashes = prep._requirements_lock_hashes(lock_path)
         self.assertEqual(set(hashes), set(locked))
         self.assertTrue(all(values and all(len(value) == 64 for value in values) for values in hashes.values()))
         self.assertTrue(
             {"pydantic", "httpx", "anyio", "ray", "sglang", "torch"}.isdisjoint(locked)
         )
+
+    def test_ifbench_broad_unused_requirements_are_source_proven(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage = Path(temporary)
+            root = stage / "third_party/IFBench"
+            root.mkdir(parents=True)
+            (root / "requirements.txt").write_text(
+                "absl-py\nspacy\nunicodedata2\n", encoding="utf-8"
+            )
+            for module in prep.IFBENCH_RUNTIME_MODULES:
+                (root / module).write_text("import re\n", encoding="utf-8")
+            report = prep._ifbench_unused_requirement_report(stage)
+            self.assertEqual(
+                report["declared_but_runtime_unused"], ["spacy", "unicodedata2"]
+            )
+            (root / "instructions.py").write_text("import spacy\n", encoding="utf-8")
+            with self.assertRaisesRegex(prep.ValidationError, "excluded dependency spacy"):
+                prep._ifbench_unused_requirement_report(stage)
 
     def test_nltk_runtime_and_data_supply_chain_are_explicitly_pinned(self) -> None:
         self.assertEqual(prep.EXPECTED_CONTAINER_PYTHON, (3, 10))

@@ -287,6 +287,13 @@ EVAL_DATASET_RM_TYPES = {
     "ifbench_test": "ifbench",
 }
 EVAL_DATASET_METADATA_KEY = "rebuttal_eval_dataset"
+IFBENCH_RUNTIME_MODULES = (
+    "evaluation_lib.py",
+    "instructions_registry.py",
+    "instructions.py",
+    "instructions_util.py",
+)
+IFBENCH_DECLARED_BUT_RUNTIME_UNUSED = ("spacy", "unicodedata2")
 
 IF_MULTI_SOURCE_KEYS = {
     "key",
@@ -705,6 +712,67 @@ def _requirements_lock_hashes(path: Path) -> dict[str, list[str]]:
     return hashes
 
 
+def _ifbench_unused_requirement_report(stage: Path) -> dict[str, Any]:
+    """Prove why two broad upstream requirements are absent from our lock.
+
+    IFBench's repository-level requirements include spaCy and unicodedata2,
+    but its pinned evaluation import closure does not reference either.  A
+    spaCy wheel cannot safely be layered with ``--no-deps`` unless its large
+    dependency closure is also frozen, so this exception is fail-closed over
+    the exact runtime modules instead of relying on an image assumption.
+    """
+
+    root = stage / "third_party/IFBench"
+    module_records: dict[str, dict[str, Any]] = {}
+    import_roots: set[str] = set()
+    for relative in IFBENCH_RUNTIME_MODULES:
+        path = root / relative
+        if not path.is_file():
+            raise ValidationError(f"IFBench runtime module is missing: {relative}")
+        text = path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError as exc:
+            raise ValidationError(f"cannot parse pinned IFBench runtime module {relative}") from exc
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                import_roots.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                import_roots.add(node.module.split(".", 1)[0])
+        for package in IFBENCH_DECLARED_BUT_RUNTIME_UNUSED:
+            if re.search(rf"\b{re.escape(package)}\b", text):
+                raise ValidationError(
+                    f"pinned IFBench runtime module {relative} now references excluded dependency {package}"
+                )
+        module_records[relative] = {
+            "bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
+    if set(IFBENCH_DECLARED_BUT_RUNTIME_UNUSED).intersection(import_roots):
+        raise ValidationError("excluded IFBench requirement entered the runtime import closure")
+    requirements_path = root / "requirements.txt"
+    requirements_text = requirements_path.read_text(encoding="utf-8")
+    declared = {
+        line.strip().lower().replace("_", "-")
+        for line in requirements_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    if not set(IFBENCH_DECLARED_BUT_RUNTIME_UNUSED).issubset(declared):
+        raise ValidationError("IFBench upstream-unused exception no longer matches requirements.txt")
+    return {
+        "upstream_revision": IFBENCH_CODE_REVISION,
+        "requirements_sha256": _sha256(requirements_path),
+        "declared_but_runtime_unused": list(IFBENCH_DECLARED_BUT_RUNTIME_UNUSED),
+        "runtime_modules": module_records,
+        "runtime_import_roots": sorted(import_roots),
+        "proof": (
+            "No identifier reference in the pinned evaluation_lib -> instructions_registry -> "
+            "instructions/instructions_util closure; real registry/build/check and Miles reward "
+            "smokes remain mandatory."
+        ),
+    }
+
+
 def _run_checked(command: list[str], *, env: dict[str, str] | None = None) -> str:
     print("RUN_SETUP " + " ".join(command), flush=True)
     result = subprocess.run(
@@ -740,14 +808,7 @@ def _provision_python_dependencies(stage: Path) -> dict[str, Any]:
             "fixed Miles container was validated with Python 3.10; refusing an unverified interpreter "
             f"{sys.version_info.major}.{sys.version_info.minor}"
         )
-    verifier_only_names = (
-        "emoji",
-        "immutabledict",
-        "langdetect",
-        "nltk",
-        "syllapy",
-        "unicodedata2",
-    )
+    verifier_only_names = ("emoji", "immutabledict", "langdetect", "nltk", "syllapy")
     protected_base_names = (
         "anyio",
         "httpx",
@@ -765,7 +826,6 @@ def _provision_python_dependencies(stage: Path) -> dict[str, Any]:
         "regex",
         "setuptools",
         "six",
-        "spacy",
         "tqdm",
         "wheel",
     )
@@ -872,7 +932,7 @@ def _provision_python_dependencies(stage: Path) -> dict[str, Any]:
 
     base_probe = (
         "import absl,anyio,click,emoji,httpx,immutabledict,joblib,langdetect,nltk,pydantic,"
-        "pydantic_settings,regex,setuptools,six,spacy,syllapy,tqdm,unicodedata2,wheel; "
+        "pydantic_settings,regex,setuptools,six,syllapy,tqdm,wheel; "
         "print('VERIFIER_DEPENDENCY_IMPORT_PROBE=PASS')"
     )
     _run_checked([sys.executable, "-c", base_probe], env=setup_env)
@@ -959,6 +1019,7 @@ def _provision_python_dependencies(stage: Path) -> dict[str, Any]:
         "verifier_only_distributions": target_distributions,
         "protected_base_distributions": list(protected_base_names),
         "required_base_distributions": list(required_base_names),
+        "ifbench_upstream_unused_requirements": _ifbench_unused_requirement_report(stage),
         "pip_dependency_resolution": (
             "disabled (--no-deps, --no-build-isolation); download and install both enforce "
             "--require-hashes"
@@ -2216,6 +2277,10 @@ def verify_dataset_bundle(output_root: Path) -> dict[str, Any]:
         raise ValidationError("dependency manifest differs from the declared official PyPI hashes")
     if dependencies.get("requirements_index") != "https://pypi.org/simple":
         raise ValidationError("dependency manifest does not pin the official PyPI simple index")
+    if dependencies.get("ifbench_upstream_unused_requirements") != _ifbench_unused_requirement_report(
+        output_root
+    ):
+        raise ValidationError("IFBench upstream-unused dependency proof differs from the frozen sources")
     if dependencies.get("nltk_compatibility") != {
         "selected_version": "3.9.4",
         "official_pypi_requires_python": ">=3.10",
