@@ -286,7 +286,19 @@ def _parse_group_identity(
             f"flight trace has invalid process_group for pg_id={pg_id}: {process_group!r}"
         )
     entry_name, entry_desc = process_group
-    group = config.get(str(pg_id))
+
+    # In the pinned Torch 2.9 recorder, ``entry.pg_id`` is an internal PG
+    # counter while ``pg_config`` is keyed by the public c10d group name.
+    # Reloading a MILES PG can therefore produce, for example, pg_id=47 with
+    # process_group=["129", "undefined"] and pg_config["129"].  Resolve the
+    # config by that exact entry identity; pg_id remains required evidence but
+    # is deliberately not treated as a pg_config key.
+    group = config.get(entry_name)
+    if entry_name in config and not isinstance(group, Mapping):
+        raise CollectiveTraceError(
+            f"flight trace has malformed config at process_group name "
+            f"{entry_name!r}: {group!r}"
+        )
     if not isinstance(group, Mapping):
         conflicting_ids = [
             key
@@ -295,8 +307,8 @@ def _parse_group_identity(
         ]
         if conflicting_ids:
             raise CollectiveTraceError(
-                f"flight trace process_group name {entry_name!r} belongs to config "
-                f"IDs {conflicting_ids!r}, not missing pg_id={pg_id}"
+                f"flight trace process_group name {entry_name!r} appears only under "
+                f"unexpected config IDs {conflicting_ids!r}"
             )
         if runtime_group_ranks is None:
             return entry_name, None, "flight_entry_process_group_name"
@@ -304,24 +316,32 @@ def _parse_group_identity(
         resolution = "flight_entry_process_group_and_live_runtime_ranks"
     else:
         name = group.get("name")
-        if not isinstance(name, str) or not name:
-            raise CollectiveTraceError(
-                f"flight trace lacks stable process-group name for pg_id={pg_id}: {name!r}"
-            )
         desc = group.get("desc")
-        if entry_name != name or (isinstance(desc, str) and entry_desc != desc):
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(desc, str)
+            or not desc
+        ):
             raise CollectiveTraceError(
-                f"flight entry/config process_group mismatch for pg_id={pg_id}: "
-                f"entry={process_group!r} config_name={name!r} config_desc={desc!r}"
+                f"flight trace lacks stable process-group identity at config "
+                f"key {entry_name!r}: name={name!r} desc={desc!r}"
+            )
+        if entry_name != name or entry_desc != desc:
+            raise CollectiveTraceError(
+                f"flight entry/config process_group mismatch for pg_id={pg_id} "
+                f"at config key {entry_name!r}: entry={process_group!r} "
+                f"config_name={name!r} config_desc={desc!r}"
             )
         matching_names = [
             key
             for key, candidate in config.items()
             if isinstance(candidate, Mapping) and candidate.get("name") == name
         ]
-        if matching_names != [str(pg_id)]:
+        if len(matching_names) != 1 or matching_names[0] != entry_name:
             raise CollectiveTraceError(
-                f"flight trace process-group name {name!r} is not uniquely bound to pg_id={pg_id}"
+                f"flight trace process-group name {name!r} is not uniquely keyed "
+                f"by its exact name: config IDs {matching_names!r}"
             )
         ranks_raw = group.get("ranks")
         try:
@@ -1675,8 +1695,8 @@ class FlightRecorderCollectiveProfiler:
                 "group_ranks": call["group_ranks"],
                 "group_resolution": call["group_resolution"],
                 "flight_group_identity_source": group_identity_source,
-                "flight_pg_config_available": flight_group_size is not None
-                and str(entry.get("pg_id")) in trace.get("pg_config", {}),
+                "flight_pg_config_available": entry["process_group"][0]
+                in trace.get("pg_config", {}),
                 "sequence_before": call["sequence_before"],
                 "collective_seq_id": call["sequence_after"],
                 "flight_record_id": entry["record_id"],
@@ -2029,7 +2049,7 @@ class FlightRecorderCollectiveProfiler:
                         "group_size": group_size,
                         "group_ranks": call_binding["group_ranks"],
                         "group_identity_source": group_identity_source,
-                        "flight_pg_config_available": str(entry.get("pg_id"))
+                        "flight_pg_config_available": entry["process_group"][0]
                         in trace.get("pg_config", {}),
                         "operation": op,
                         "rank_local_logical_input_bytes": runtime_logical_bytes,

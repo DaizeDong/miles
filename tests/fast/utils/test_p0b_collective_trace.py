@@ -384,6 +384,86 @@ def test_missing_retired_pg_config_binds_flight_name_to_live_runtime_ranks(tmp_p
     assert parsed["flight_pg_config_available"] is False
 
 
+def test_reloaded_production_tuple_resolves_config_by_exact_entry_name(tmp_path):
+    entry = flight_entry(0, sequence=1, shape=[4], duration_ms=0.25)
+    entry["pg_id"] = 47
+    entry["process_group"] = ["129", "undefined"]
+    named_config = {
+        "129": {"name": "129", "desc": "undefined", "ranks": "[0, 1]"}
+    }
+    boundary_trace = boundary([entry])
+    boundary_trace["pg_config"] = copy.deepcopy(named_config)
+    boundary_trace["pg_status"] = {"129": {}}
+    retired_trace = trace([entry])
+    retired_trace["pg_config"] = copy.deepcopy(named_config)
+    retired_trace["pg_status"] = {"129": {}}
+    profiler, fake_torch = profiler_for(
+        tmp_path, trace([]), boundary_trace, retired_trace
+    )
+    fake_torch.distributed.group = FakeGroup(name="129")
+
+    profiler.begin_outer(3)
+    fake_torch.distributed.all_reduce(FakeTensor([4]))
+    frozen = profiler.freeze_outer_boundary(3)
+    assert frozen["available"] is True
+    collective_bytes, collective_seconds, evidence = profiler.end_outer(3)
+
+    assert collective_bytes == 16
+    assert collective_seconds == pytest.approx(0.00025)
+    assert evidence["available"] is True
+    payload = json.loads(open(evidence["trace_path"], encoding="utf-8").read())
+    call = payload["public_call_evidence"][0]
+    parsed = payload["entries"][0]
+    assert call["group_name"] == "129"
+    assert call["flight_pg_config_available"] is True
+    assert call["flight_group_identity_source"] == (
+        "flight_pg_config_and_live_runtime_ranks"
+    )
+    assert parsed["pg_id"] == 47
+    assert parsed["process_group"] == ["129", "undefined"]
+    assert parsed["flight_pg_config_available"] is True
+    assert parsed["group_ranks"] == [0, 1]
+
+
+def test_exact_entry_name_config_rejects_ambiguous_same_name(tmp_path):
+    entry = flight_entry(0, sequence=1, shape=[4])
+    entry["pg_id"] = 47
+    entry["process_group"] = ["129", "undefined"]
+    boundary_trace = boundary([entry])
+    boundary_trace["pg_config"] = {
+        "129": {"name": "129", "desc": "undefined", "ranks": "[0, 1]"},
+        "777": {"name": "129", "desc": "undefined", "ranks": "[0, 1]"},
+    }
+    profiler, fake_torch = profiler_for(tmp_path, trace([]), boundary_trace)
+    fake_torch.distributed.group = FakeGroup(name="129")
+
+    profiler.begin_outer(3)
+    fake_torch.distributed.all_reduce(FakeTensor([4]))
+    frozen = profiler.freeze_outer_boundary(3)
+
+    assert frozen["available"] is False
+    assert "not uniquely keyed by its exact name" in frozen["error_message"]
+
+
+def test_exact_entry_name_config_rejects_description_conflict(tmp_path):
+    entry = flight_entry(0, sequence=1, shape=[4])
+    entry["pg_id"] = 47
+    entry["process_group"] = ["129", "undefined"]
+    boundary_trace = boundary([entry])
+    boundary_trace["pg_config"] = {
+        "129": {"name": "129", "desc": "conflict", "ranks": "[0, 1]"}
+    }
+    profiler, fake_torch = profiler_for(tmp_path, trace([]), boundary_trace)
+    fake_torch.distributed.group = FakeGroup(name="129")
+
+    profiler.begin_outer(3)
+    fake_torch.distributed.all_reduce(FakeTensor([4]))
+    frozen = profiler.freeze_outer_boundary(3)
+
+    assert frozen["available"] is False
+    assert "entry/config process_group mismatch" in frozen["error_message"]
+
+
 @pytest.mark.parametrize(
     "process_group",
     [None, [], ["47"], ["", "desc"], ["47", ""], [47, "desc"]],
@@ -423,9 +503,7 @@ def test_missing_pg_config_rejects_name_bound_to_a_different_pg_id(tmp_path):
     frozen = profiler.freeze_outer_boundary(3)
 
     assert frozen["available"] is False
-    assert "belongs to config IDs ['12'], not missing pg_id=47" in frozen[
-        "error_message"
-    ]
+    assert "appears only under unexpected config IDs ['12']" in frozen["error_message"]
 
 
 def test_torch_2_9_coalescing_transaction_aggregates_runtime_inputs_and_real_work(
