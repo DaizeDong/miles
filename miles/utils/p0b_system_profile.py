@@ -1,27 +1,45 @@
 """Opt-in, process-local measurements for the P0-B fixed-rollout profile.
 
 This module deliberately reports only quantities observed by trusted runtime
-sources.  Ray object-store/spill values come from Ray's pinned 2.44.1 global
-memory-info reply.  Collective traffic is not inferred from tensor sizes; it
-is emitted as JSON ``null`` until a source can measure the claimed quantity.
-The feature is inert unless ``MILES_P0B_SYSTEM_PROFILE=1``.
+sources. Ray object-store/spill values come from Ray's pinned 2.44.1 global
+memory-info reply. Collective bytes and device time come from the retained
+ProcessGroupNCCL flight recorder, never configured shapes, wire-byte formulae,
+or host enqueue timing. The feature is inert unless
+``MILES_P0B_SYSTEM_PROFILE=1``.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import math
+import numbers
 import os
 import socket
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from miles.utils.p0b_collective_trace import FlightRecorderCollectiveProfiler
+
 
 _ENABLED_ENV = "MILES_P0B_SYSTEM_PROFILE"
 _OUTERS_ENV = "MILES_P0B_MEASURED_OUTER_IDS"
 _DEFAULT_MEASURED_OUTERS = frozenset(range(3, 13))
 _PINNED_RAY_VERSION = "2.44.1"
+_RAY_SOURCE = "ray._private.internal_api.get_memory_info_reply"
+_PROFILE_ID = "p0b_system_profile_v2"
+_SCHEMA_VERSION = 2
+
+
+def _source_identity() -> dict[str, str]:
+    path = os.path.realpath(__file__)
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"path": path, "sha256": digest.hexdigest()}
 
 
 class _RayObjectStoreReader:
@@ -38,38 +56,145 @@ class _RayObjectStoreReader:
     def __call__(self) -> Mapping[str, Any]:
         import ray
         from ray._private import internal_api
+        from ray._private import worker as ray_worker
 
         version = str(ray.__version__)
         if version != _PINNED_RAY_VERSION:
             raise RuntimeError(
                 f"P0-B Ray counters require Ray {_PINNED_RAY_VERSION}, got {version}"
             )
+        gcs_client = getattr(ray_worker.global_worker, "gcs_client", None)
+        gcs_address = getattr(gcs_client, "address", None)
+        if not isinstance(gcs_address, str) or not gcs_address:
+            raise RuntimeError("P0-B Ray snapshot cannot bind the live GCS address")
+        cluster_id = _runtime_identifier(getattr(gcs_client, "cluster_id", None))
+        if cluster_id is None:
+            raise RuntimeError("P0-B Ray snapshot cannot bind the live Ray cluster ID")
         if self._state is None:
-            self._state = internal_api.get_state_from_address()
+            self._state = internal_api.get_state_from_address(gcs_address)
         reply = internal_api.get_memory_info_reply(self._state)
         stats = reply.store_stats
+        context = ray.get_runtime_context()
+        job_id = _runtime_identifier(context.get_job_id())
+        if job_id is None:
+            raise RuntimeError("P0-B Ray snapshot cannot bind the live Ray job ID")
         return {
             "object_store_bytes_used": stats.object_store_bytes_used,
             "spilled_bytes_total": stats.spilled_bytes_total,
             "ray_version": version,
-            "source": "ray._private.internal_api.get_memory_info_reply",
+            "source": _RAY_SOURCE,
+            "cluster_identity": {
+                "gcs_address": gcs_address,
+                "cluster_id": cluster_id,
+                "job_id": job_id,
+            },
+            "captured_monotonic_ns": time.monotonic_ns(),
         }
 
 
+def _bounded_repr(value: Any, limit: int = 160) -> str:
+    rendered = repr(value)
+    if len(rendered) <= limit:
+        return rendered
+    return rendered[: limit - 3] + "..."
+
+
+def _runtime_identifier(value: Any) -> str | None:
+    """Canonicalize a Ray binary ID without accepting a missing identity."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, bytes):
+        return value.hex() or None
+    hex_method = getattr(value, "hex", None)
+    if callable(hex_method):
+        try:
+            rendered = hex_method()
+        except Exception:
+            rendered = None
+        if isinstance(rendered, str) and rendered:
+            return rendered
+    rendered = str(value)
+    return rendered if rendered else None
+
+
+def _validated_integral_counter(value: Any, name: str) -> tuple[int, dict[str, Any]]:
+    """Validate a runtime numeric counter while retaining its raw schema."""
+
+    raw = {
+        "type": f"{type(value).__module__}.{type(value).__qualname__}",
+        "repr": _bounded_repr(value),
+    }
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(
+            f"invalid Ray counter {name}: type={raw['type']} value={raw['repr']} is not numeric"
+        )
+    # Integral counters must never round-trip through binary64: object-store
+    # byte counters can legitimately exceed 2**53.
+    if isinstance(value, numbers.Integral):
+        integer = int(value)
+        if integer < 0:
+            raise ValueError(
+                f"invalid Ray counter {name}: type={raw['type']} value={raw['repr']} "
+                "must be finite, non-negative, and integral"
+            )
+    else:
+        try:
+            numeric = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"invalid Ray counter {name}: type={raw['type']} value={raw['repr']} is not finite"
+            ) from exc
+        if not math.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+            raise ValueError(
+                f"invalid Ray counter {name}: type={raw['type']} value={raw['repr']} "
+                "must be finite, non-negative, and integral"
+            )
+        integer = int(numeric)
+    raw["validated_integer"] = integer
+    return integer, raw
+
+
 def _validated_ray_snapshot(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the two counters without coercing malformed values to zero."""
+    """Validate live Ray counters without coercing malformed values to zero."""
 
     values: dict[str, int] = {}
+    raw_fields: dict[str, dict[str, Any]] = {}
     for name in ("object_store_bytes_used", "spilled_bytes_total"):
-        value = raw.get(name)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"invalid Ray counter {name}={value!r}")
+        value, evidence = _validated_integral_counter(raw.get(name), name)
         values[name] = value
+        raw_fields[name] = evidence
+    version = raw.get("ray_version")
+    source = raw.get("source")
+    cluster_identity = raw.get("cluster_identity")
+    captured_monotonic_ns = raw.get("captured_monotonic_ns")
+    if version != _PINNED_RAY_VERSION:
+        raise ValueError(f"invalid Ray snapshot version={version!r}")
+    if source != _RAY_SOURCE:
+        raise ValueError(f"invalid Ray snapshot source={source!r}")
+    if not isinstance(cluster_identity, Mapping) or not all(
+        isinstance(cluster_identity.get(key), str) and cluster_identity.get(key)
+        for key in ("gcs_address", "cluster_id", "job_id")
+    ):
+        raise ValueError(f"invalid Ray snapshot cluster_identity={cluster_identity!r}")
+    if (
+        isinstance(captured_monotonic_ns, bool)
+        or not isinstance(captured_monotonic_ns, int)
+        or captured_monotonic_ns <= 0
+    ):
+        raise ValueError(
+            f"invalid Ray snapshot captured_monotonic_ns={captured_monotonic_ns!r}"
+        )
     return {
         "available": True,
         **values,
-        "ray_version": raw.get("ray_version"),
-        "source": raw.get("source"),
+        "raw_fields": raw_fields,
+        "ray_version": version,
+        "source": source,
+        "cluster_identity": dict(cluster_identity),
+        "captured_monotonic_ns": captured_monotonic_ns,
     }
 
 
@@ -226,8 +351,10 @@ class P0BSystemProfiler:
         environ: Mapping[str, str] | None = None,
         output=print,
         ray_snapshot_provider: Callable[[], Mapping[str, Any]] | None = None,
+        collective_profiler: Any | None = None,
     ) -> None:
         environ = os.environ if environ is None else environ
+        self._environ = environ
         self._torch = torch_module
         requested = _profile_enabled(environ)
         self._measured_outers = _measured_outer_ids(environ)
@@ -236,7 +363,20 @@ class P0BSystemProfiler:
         self._world_size = int(world_size)
         self._output = output
         self._ray_snapshot_provider = ray_snapshot_provider or _RayObjectStoreReader()
+        self._collective_profiler = (
+            collective_profiler
+            if collective_profiler is not None
+            else FlightRecorderCollectiveProfiler(
+                torch_module=torch_module,
+                rank=self._rank,
+                world_size=self._world_size,
+                enabled=self._enabled,
+                environ=environ,
+            )
+        )
+        self._source_identity = _source_identity() if self._enabled else None
         self._ray_start: dict[str, Any] | None = None
+        self._collective_begin_error: dict[str, Any] | None = None
         self._outer_id: int | None = None
         self._detail: dict[str, Any] = {}
         self._payload_stats: dict[str, int] = {
@@ -256,18 +396,35 @@ class P0BSystemProfiler:
             return
         self._outer_id = int(outer_id)
         self._ray_start = None
+        self._collective_begin_error = None
         self._detail = {
-            "schema_version": 1,
+            "schema_version": _SCHEMA_VERSION,
+            "profile_id": _PROFILE_ID,
             "scope": "primary_training_rank_process_local",
             "rank": self._rank,
             "world_size": self._world_size,
             "hostname": socket.gethostname().split(".", 1)[0],
+            "slurm_job_id": self._environ.get("SLURM_JOB_ID"),
+            "process_id": os.getpid(),
+            "source": self._source_identity,
             "timestamps": {},
-            "unavailable": [
-                "actor_ray_transport_bytes",
-                "collective_bytes",
-                "collective_time_seconds",
-            ],
+            "unavailable": [],
+            "metric_semantics": {
+                "ray_object_store_bytes": (
+                    "end-of-outer cluster-global Ray object_store_bytes_used gauge"
+                ),
+                "ray_spill_bytes": (
+                    "cluster-global spilled_bytes_total end-minus-begin delta"
+                ),
+                "collective_bytes": (
+                    "primary-rank logical input-tensor bytes at supported c10d collective calls; "
+                    "not multiplied by group size and not network/wire bytes"
+                ),
+                "collective_time_seconds": (
+                    "sum of primary-rank ProcessGroupNCCL accelerator-event durations; "
+                    "host enqueue/discovery time excluded"
+                ),
+            },
         }
         rss, peak_rss = _proc_memory_bytes()
         self._detail["process_memory_at_start"] = {
@@ -275,6 +432,14 @@ class P0BSystemProfiler:
             "lifetime_peak_rss_bytes": peak_rss,
         }
         if self._outer_id in self._measured_outers:
+            try:
+                self._collective_profiler.begin_outer(self._outer_id)
+            except Exception as exc:
+                self._collective_begin_error = {
+                    "available": False,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc)[:512],
+                }
             self._ray_start = self._capture_ray_snapshot()
         cuda = getattr(self._torch, "cuda", None)
         if cuda is not None:
@@ -359,6 +524,19 @@ class P0BSystemProfiler:
         }
 
         if outer_id in self._measured_outers:
+            if self._collective_begin_error is None:
+                collective_bytes, collective_time_seconds, collective_evidence = (
+                    self._collective_profiler.end_outer(outer_id)
+                )
+            else:
+                collective_bytes = None
+                collective_time_seconds = None
+                collective_evidence = self._collective_begin_error
+            self._detail["collective_trace"] = collective_evidence
+            if collective_bytes is None:
+                self._detail["unavailable"].append("collective_bytes")
+            if collective_time_seconds is None:
+                self._detail["unavailable"].append("collective_time_seconds")
             ray_end = self._capture_ray_snapshot()
             ray_object_store_bytes, ray_spill_bytes, ray_evidence = self._ray_outer_metrics(
                 self._ray_start, ray_end
@@ -375,9 +553,14 @@ class P0BSystemProfiler:
                 "ray_object_store_bytes": ray_object_store_bytes,
                 "ray_spill_bytes": ray_spill_bytes,
                 "rollout_payload_bytes": self._payload_stats["unique_storage_bytes"],
-                "collective_bytes": None,
-                "collective_time_seconds": None,
+                "collective_bytes": collective_bytes,
+                "collective_time_seconds": collective_time_seconds,
             }
+            self._detail["profile_status"] = (
+                "complete"
+                if not any(system_value is None for system_value in system.values())
+                else "incomplete_evidence"
+            )
             compact = {key: value for key, value in self._detail.items()}
             self._output(
                 f"P0B_DETAIL outer_id={outer_id} "
@@ -391,6 +574,7 @@ class P0BSystemProfiler:
             )
         self._outer_id = None
         self._ray_start = None
+        self._collective_begin_error = None
 
     def _capture_ray_snapshot(self) -> dict[str, Any]:
         try:
@@ -402,6 +586,8 @@ class P0BSystemProfiler:
             return {
                 "available": False,
                 "error_type": type(exc).__name__,
+                "error_message": str(exc)[:512],
+                "captured_monotonic_ns": time.monotonic_ns(),
             }
 
     @staticmethod
@@ -413,6 +599,19 @@ class P0BSystemProfiler:
 
         end_available = bool(end.get("available"))
         begin_available = begin is not None and bool(begin.get("available"))
+        identity_matches = bool(
+            begin_available
+            and end_available
+            and begin.get("ray_version") == end.get("ray_version") == _PINNED_RAY_VERSION
+            and begin.get("source") == end.get("source")
+            and begin.get("cluster_identity") == end.get("cluster_identity")
+            and isinstance(begin.get("captured_monotonic_ns"), int)
+            and isinstance(end.get("captured_monotonic_ns"), int)
+            and int(end["captured_monotonic_ns"]) >= int(begin["captured_monotonic_ns"])
+        )
+        if not identity_matches:
+            end_available = False
+            begin_available = False
         object_store_bytes = int(end["object_store_bytes_used"]) if end_available else None
         spill_bytes: int | None = None
         spill_status = "unavailable"
@@ -431,6 +630,7 @@ class P0BSystemProfiler:
             "begin": begin,
             "end": end,
             "spill_status": spill_status,
+            "snapshot_identity_matches": identity_matches,
         }
 
     @staticmethod

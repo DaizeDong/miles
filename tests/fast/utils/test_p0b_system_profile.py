@@ -1,9 +1,15 @@
 import json
+import math
 import sys
 import types
 from dataclasses import dataclass
 
-from miles.utils.p0b_system_profile import P0BSystemProfiler, _RayObjectStoreReader, tensor_payload_stats
+from miles.utils.p0b_system_profile import (
+    P0BSystemProfiler,
+    _RayObjectStoreReader,
+    _validated_ray_snapshot,
+    tensor_payload_stats,
+)
 
 
 class FakeStorage:
@@ -89,12 +95,48 @@ class SnapshotProvider:
         return value
 
 
-def ray_snapshot(*, used, spilled):
+class FakeCollectiveProfiler:
+    def __init__(self, *, logical_bytes=4096, time_seconds=0.25, available=True):
+        self.logical_bytes = logical_bytes
+        self.time_seconds = time_seconds
+        self.available = available
+        self.begun = []
+        self.ended = []
+
+    def begin_outer(self, outer_id):
+        self.begun.append(outer_id)
+
+    def end_outer(self, outer_id):
+        self.ended.append(outer_id)
+        evidence = {
+            "available": self.available,
+            "trace_path": f"/shared_nfs/unit/outer-{outer_id}.json",
+            "trace_sha256": "a" * 64,
+            "rank_local_logical_input_bytes": self.logical_bytes,
+            "device_duration_ms": self.time_seconds * 1000,
+        }
+        if not self.available:
+            return None, None, evidence
+        return self.logical_bytes, self.time_seconds, evidence
+
+
+class FailingBeginCollectiveProfiler(FakeCollectiveProfiler):
+    def begin_outer(self, outer_id):
+        raise RuntimeError("trace begin failed")
+
+
+def ray_snapshot(*, used, spilled, captured_monotonic_ns=1):
     return {
         "object_store_bytes_used": used,
         "spilled_bytes_total": spilled,
         "ray_version": "2.44.1",
-        "source": "unit-test",
+        "source": "ray._private.internal_api.get_memory_info_reply",
+        "cluster_identity": {
+            "gcs_address": "127.0.0.1:6379",
+            "cluster_id": "cluster-1",
+            "job_id": "job-1",
+        },
+        "captured_monotonic_ns": captured_monotonic_ns,
     }
 
 
@@ -102,7 +144,8 @@ def test_pinned_ray_reader_uses_fresh_global_reply_and_caches_state():
     calls = {"state": 0, "reply": 0}
     state = object()
 
-    def get_state_from_address():
+    def get_state_from_address(address):
+        assert address == "127.0.0.1:6379"
         calls["state"] += 1
         return state
 
@@ -117,20 +160,30 @@ def test_pinned_ray_reader_uses_fresh_global_reply_and_caches_state():
 
     fake_ray = types.ModuleType("ray")
     fake_ray.__version__ = "2.44.1"
+    fake_ray.get_runtime_context = lambda: types.SimpleNamespace(get_job_id=lambda: "job-1")
     fake_private = types.ModuleType("ray._private")
     fake_internal_api = types.ModuleType("ray._private.internal_api")
+    fake_worker = types.ModuleType("ray._private.worker")
+    fake_worker.global_worker = types.SimpleNamespace(
+        gcs_client=types.SimpleNamespace(
+            address="127.0.0.1:6379",
+            cluster_id=types.SimpleNamespace(hex=lambda: "cluster-1"),
+        )
+    )
     fake_internal_api.get_state_from_address = get_state_from_address
     fake_internal_api.get_memory_info_reply = get_memory_info_reply
     fake_private.internal_api = fake_internal_api
+    fake_private.worker = fake_worker
     fake_ray._private = fake_private
 
-    names = ("ray", "ray._private", "ray._private.internal_api")
+    names = ("ray", "ray._private", "ray._private.internal_api", "ray._private.worker")
     previous = {name: sys.modules.get(name) for name in names}
     sys.modules.update(
         {
             "ray": fake_ray,
             "ray._private": fake_private,
             "ray._private.internal_api": fake_internal_api,
+            "ray._private.worker": fake_worker,
         }
     )
     try:
@@ -144,6 +197,49 @@ def test_pinned_ray_reader_uses_fresh_global_reply_and_caches_state():
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = module
+
+
+def test_ray_integral_runtime_schema_retains_raw_types_and_rejects_bad_values():
+    validated = _validated_ray_snapshot(ray_snapshot(used=12.0, spilled=0))
+    assert validated["object_store_bytes_used"] == 12
+    assert validated["spilled_bytes_total"] == 0
+    assert validated["raw_fields"]["object_store_bytes_used"] == {
+        "type": "builtins.float",
+        "repr": "12.0",
+        "validated_integer": 12,
+    }
+    exact_large = 2**60 + 1
+    large = _validated_ray_snapshot(ray_snapshot(used=exact_large, spilled=0))
+    assert large["object_store_bytes_used"] == exact_large
+    assert large["raw_fields"]["object_store_bytes_used"]["validated_integer"] == exact_large
+    for value in (True, -1, 1.5, math.nan, math.inf, -math.inf, None, "1"):
+        malformed = ray_snapshot(used=value, spilled=0)
+        try:
+            _validated_ray_snapshot(malformed)
+        except ValueError as exc:
+            message = str(exc)
+            assert "object_store_bytes_used" in message
+            assert "type=" in message and "value=" in message
+        else:
+            raise AssertionError(f"malformed Ray counter passed: {value!r}")
+
+    for field, value in (
+        ("ray_version", "2.45.0"),
+        ("source", "different.api"),
+        (
+            "cluster_identity",
+            {"gcs_address": "", "cluster_id": "cluster-1", "job_id": "job-1"},
+        ),
+        ("captured_monotonic_ns", 0),
+    ):
+        malformed = ray_snapshot(used=1, spilled=0)
+        malformed[field] = value
+        try:
+            _validated_ray_snapshot(malformed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"malformed Ray snapshot field passed: {field}={value!r}")
 
 
 @dataclass
@@ -253,6 +349,7 @@ def test_measured_outer_emits_detail_and_exact_collector_schema():
         environ={"MILES_P0B_SYSTEM_PROFILE": "1", "MILES_P0B_MEASURED_OUTER_IDS": "3"},
         output=output,
         ray_snapshot_provider=snapshots,
+        collective_profiler=FakeCollectiveProfiler(),
     )
     payload_tensor = FakeTensor(pointer=10, storage_bytes=128, logical_bytes=96)
     cache_tensor = FakeTensor(pointer=11, storage_bytes=256, logical_bytes=128)
@@ -310,7 +407,15 @@ def test_measured_outer_emits_detail_and_exact_collector_schema():
     assert system["rollout_payload_bytes"] == 128
     assert system["ray_object_store_bytes"] == 1200
     assert system["ray_spill_bytes"] == 24
-    assert system["collective_bytes"] is None
+    assert system["collective_bytes"] == 4096
+    assert system["collective_time_seconds"] == 0.25
+    assert detail["collective_trace"]["available"] is True
+    assert "collective_bytes" not in detail["unavailable"]
+    assert "collective_time_seconds" not in detail["unavailable"]
+    assert detail["profile_id"] == "p0b_system_profile_v2"
+    assert detail["schema_version"] == 2
+    assert detail["profile_status"] == "complete"
+    assert detail["unavailable"] == []
     assert snapshots.calls == 2
 
 
@@ -328,6 +433,7 @@ def test_ray_spill_counter_regression_is_unavailable_not_negative_or_zero():
         environ={"MILES_P0B_SYSTEM_PROFILE": "1", "MILES_P0B_MEASURED_OUTER_IDS": "3"},
         output=lambda *args, **kwargs: lines.append(args[0]),
         ray_snapshot_provider=snapshots,
+        collective_profiler=FakeCollectiveProfiler(),
     )
     profiler.begin_outer(3)
     profiler.emit_outer()
@@ -356,6 +462,7 @@ def test_ray_snapshot_failure_and_malformed_values_fail_closed():
             environ={"MILES_P0B_SYSTEM_PROFILE": "1", "MILES_P0B_MEASURED_OUTER_IDS": "3"},
             output=lambda *args, **kwargs: lines.append(args[0]),
             ray_snapshot_provider=snapshots,
+            collective_profiler=FakeCollectiveProfiler(),
         )
         profiler.begin_outer(3)
         profiler.emit_outer()
@@ -370,6 +477,81 @@ def test_ray_snapshot_failure_and_malformed_values_fail_closed():
         assert "ray_spill_bytes" in detail["unavailable"]
 
 
+def test_ray_requires_both_snapshots_and_matching_live_identity():
+    cases = (
+        (
+            RuntimeError("begin RPC failed"),
+            ray_snapshot(used=200, spilled=20, captured_monotonic_ns=2),
+        ),
+        (
+            ray_snapshot(used=100, spilled=10, captured_monotonic_ns=2),
+            {
+                **ray_snapshot(used=200, spilled=20, captured_monotonic_ns=3),
+                "cluster_identity": {
+                    "gcs_address": "127.0.0.1:6380",
+                    "cluster_id": "cluster-1",
+                    "job_id": "job-1",
+                },
+            },
+        ),
+        (
+            ray_snapshot(used=100, spilled=10, captured_monotonic_ns=4),
+            ray_snapshot(used=200, spilled=20, captured_monotonic_ns=3),
+        ),
+    )
+    for begin, end in cases:
+        lines = []
+        profiler = P0BSystemProfiler(
+            torch_module=FakeTorch,
+            rank=0,
+            world_size=8,
+            primary=True,
+            environ={"MILES_P0B_SYSTEM_PROFILE": "1", "MILES_P0B_MEASURED_OUTER_IDS": "3"},
+            output=lambda *args, **kwargs: lines.append(args[0]),
+            ray_snapshot_provider=SnapshotProvider(begin, end),
+            collective_profiler=FakeCollectiveProfiler(),
+        )
+        profiler.begin_outer(3)
+        profiler.emit_outer()
+        detail = json.loads(lines[0].split(" ", 2)[2])
+        system = json.loads(lines[1].split(" ", 2)[2])
+        assert system["ray_object_store_bytes"] is None
+        assert system["ray_spill_bytes"] is None
+        assert detail["ray_object_store"]["snapshot_identity_matches"] is False
+        assert detail["profile_status"] == "incomplete_evidence"
+
+
+def test_collective_unavailable_or_begin_failure_emits_null_and_blocks_complete_status():
+    for collective in (
+        FakeCollectiveProfiler(available=False),
+        FailingBeginCollectiveProfiler(),
+    ):
+        lines = []
+        profiler = P0BSystemProfiler(
+            torch_module=FakeTorch,
+            rank=0,
+            world_size=8,
+            primary=True,
+            environ={"MILES_P0B_SYSTEM_PROFILE": "1", "MILES_P0B_MEASURED_OUTER_IDS": "3"},
+            output=lambda *args, **kwargs: lines.append(args[0]),
+            ray_snapshot_provider=SnapshotProvider(
+                ray_snapshot(used=100, spilled=10, captured_monotonic_ns=1),
+                ray_snapshot(used=200, spilled=20, captured_monotonic_ns=2),
+            ),
+            collective_profiler=collective,
+        )
+        profiler.begin_outer(3)
+        profiler.emit_outer()
+        detail = json.loads(lines[0].split(" ", 2)[2])
+        system = json.loads(lines[1].split(" ", 2)[2])
+        assert system["collective_bytes"] is None
+        assert system["collective_time_seconds"] is None
+        assert detail["collective_trace"]["available"] is False
+        assert detail["unavailable"].count("collective_bytes") == 1
+        assert detail["unavailable"].count("collective_time_seconds") == 1
+        assert detail["profile_status"] == "incomplete_evidence"
+
+
 def test_warmup_outer_does_not_emit_marker():
     lines = []
     snapshots = SnapshotProvider(RuntimeError("must not be called"))
@@ -381,6 +563,7 @@ def test_warmup_outer_does_not_emit_marker():
         environ={"MILES_P0B_SYSTEM_PROFILE": "1"},
         output=lambda *args, **kwargs: lines.append(args[0]),
         ray_snapshot_provider=snapshots,
+        collective_profiler=FakeCollectiveProfiler(),
     )
     profiler.begin_outer(2)
     profiler.emit_outer()
@@ -391,6 +574,7 @@ def test_warmup_outer_does_not_emit_marker():
 def test_default_window_emits_exactly_ten_outers_and_resets_each_outer():
     lines = []
     FakeCuda.reset_calls = 0
+    collective = FakeCollectiveProfiler()
     profiler = P0BSystemProfiler(
         torch_module=FakeTorch,
         rank=0,
@@ -399,6 +583,7 @@ def test_default_window_emits_exactly_ten_outers_and_resets_each_outer():
         environ={"MILES_P0B_SYSTEM_PROFILE": "1"},
         output=lambda *args, **kwargs: lines.append(args[0]),
         ray_snapshot_provider=lambda: ray_snapshot(used=1000, spilled=40),
+        collective_profiler=collective,
     )
     tensor = FakeTensor(pointer=99, storage_bytes=128, logical_bytes=64)
     for outer_id in range(13):
@@ -410,3 +595,5 @@ def test_default_window_emits_exactly_ten_outers_and_resets_each_outer():
     system_lines = [line for line in lines if line.startswith("P0B_SYSTEM")]
     assert [int(line.split(" ", 2)[1].split("=", 1)[1]) for line in system_lines] == list(range(3, 13))
     assert FakeCuda.reset_calls == 13
+    assert collective.begun == list(range(3, 13))
+    assert collective.ended == list(range(3, 13))
