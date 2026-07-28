@@ -151,16 +151,17 @@ _PUBLIC_CALL_SPECS = {
         0, 1, frozenset({"all_reduce_barrier", "barrier"}), None, None
     ),
 }
-# Object collectives and point-to-point APIs do not have the tensor-payload
-# semantics claimed by ``collective_bytes``.  Observe them at the public API
-# boundary so an implementation that happens to lower one through an
-# allowlisted ProcessGroup operation cannot silently turn it into a tensor
-# collective.
+# CPU/Gloo object collectives are control-plane traffic, not accelerator tensor
+# collectives.  They are explicitly recorded and excluded only after binding
+# the live process-group backend to Gloo.  Object calls on any other backend,
+# and all tensor P2P APIs, remain fail-closed.
+_GLOO_CONTROL_OBJECT_GROUP_INDEX = {
+    "gather_object": 3,
+}
 _UNSUPPORTED_HIGH_LEVEL_NAMES = {
     "all_gather_object",
     "batch_isend_irecv",
     "broadcast_object_list",
-    "gather_object",
     "irecv",
     "isend",
     "monitored_barrier",
@@ -503,6 +504,48 @@ def _install_collective_observers(dist_module: Any) -> None:
         wrapped._p0b_async_tracker_wrapper = True  # type: ignore[attr-defined]
         setattr(dist_module, name, wrapped)
 
+    for name, group_index in _GLOO_CONTROL_OBJECT_GROUP_INDEX.items():
+        original = getattr(dist_module, name, None)
+        if original is None or getattr(original, "_p0b_gloo_control_tracker_wrapper", False):
+            continue
+
+        @functools.wraps(original)
+        def wrapped_gloo_control(
+            *args: Any,
+            __name: str = name,
+            __group_index: int = group_index,
+            __original: Any = original,
+            **kwargs: Any,
+        ) -> Any:
+            if getattr(_TRACKER_GUARD, "active", False):
+                return __original(*args, **kwargs)
+            tracker = _ACTIVE_TRACKERS.get(os.getpid())
+            context: dict[str, Any] | None = None
+            if tracker is not None and tracker.active_outer is not None:
+                try:
+                    context = tracker.prepare_gloo_control_object_call(
+                        __name, __group_index, args, kwargs
+                    )
+                except Exception as exc:
+                    tracker.mark_unavailable(
+                        f"object collective backend binding failed for {__name}: {exc}"
+                    )
+            # Suppress the object's private tensor lowering.  It belongs to the
+            # verified CPU/Gloo control call and is outside the accelerator
+            # tensor-collective metric; recording it as a public tensor API
+            # would double-classify one workload action.
+            _TRACKER_GUARD.active = True
+            try:
+                result = __original(*args, **kwargs)
+            finally:
+                _TRACKER_GUARD.active = False
+            if tracker is not None and context is not None:
+                tracker.complete_gloo_control_object_call(context)
+            return result
+
+        wrapped_gloo_control._p0b_gloo_control_tracker_wrapper = True  # type: ignore[attr-defined]
+        setattr(dist_module, name, wrapped_gloo_control)
+
     for name in _UNSUPPORTED_HIGH_LEVEL_NAMES:
         original = getattr(dist_module, name, None)
         if original is None or getattr(original, "_p0b_unsupported_tracker_wrapper", False):
@@ -678,6 +721,7 @@ class FlightRecorderCollectiveProfiler:
         self._begin_nccl_version: str | None = None
         self._errors: list[str] = []
         self._observed_calls: list[dict[str, Any]] = []
+        self._excluded_control_collectives: list[dict[str, Any]] = []
         self._next_call_id = 0
         self._frozen_outer_id: int | None = None
         self._frozen_boundary_trace: dict[str, Any] | None = None
@@ -880,6 +924,7 @@ class FlightRecorderCollectiveProfiler:
         self._begin_nccl_version = nccl_version
         self._errors = []
         self._observed_calls = []
+        self._excluded_control_collectives = []
         self._next_call_id = 0
         self._frozen_outer_id = None
         self._frozen_boundary_trace = None
@@ -1183,6 +1228,48 @@ class FlightRecorderCollectiveProfiler:
             "runtime_rank_local_logical_input_bytes": logical_bytes,
             "runtime_input_tensors": tensor_evidence,
         }
+
+    def prepare_gloo_control_object_call(
+        self,
+        name: str,
+        group_index: int,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self.active_outer is None:
+            raise CollectiveTraceError("Gloo object collective observed outside an active outer")
+        if self._frozen_outer_id is not None:
+            raise CollectiveTraceError(
+                f"Gloo object collective {name} observed after outer-close boundary freeze"
+            )
+        group = _positional_or_keyword(args, kwargs, "group", group_index, None)
+        if group is None:
+            group = self._default_group()
+        group, group_resolution = self._resolve_runtime_group(group)
+        get_backend = getattr(self._torch.distributed, "get_backend", None)
+        if not callable(get_backend):
+            raise CollectiveTraceError("torch.distributed.get_backend is unavailable")
+        backend_value = get_backend(group)
+        backend = str(backend_value).strip().lower()
+        if backend != "gloo":
+            raise CollectiveTraceError(
+                f"object collective {name} backend must be exactly gloo, got {backend_value!r}"
+            )
+        return {
+            "public_api": name,
+            "backend": backend,
+            "group_name": self._group_name(group),
+            "group_size": self._group_size(group),
+            "group_resolution": group_resolution,
+            "metric_inclusion": "excluded",
+            "reason": (
+                "verified CPU/Gloo object control collective outside the "
+                "accelerator tensor-collective byte/time metric"
+            ),
+        }
+
+    def complete_gloo_control_object_call(self, context: Mapping[str, Any]) -> None:
+        self._excluded_control_collectives.append(dict(context))
 
     def complete_public_call(self, context: dict[str, Any], result: Any) -> None:
         sequence_after = self._group_sequence(context["group"])
@@ -1953,6 +2040,7 @@ class FlightRecorderCollectiveProfiler:
                 "pg_config": trace.get("pg_config"),
                 "pg_status": trace.get("pg_status"),
                 "megatron_collective_alias_bindings": self._megatron_alias_bindings,
+                "excluded_control_collectives": list(self._excluded_control_collectives),
                 "operation_histogram": dict(sorted(op_histogram.items())),
                 "group_size_histogram": dict(sorted(group_histogram.items())),
                 "public_call_evidence": call_evidence,
@@ -2002,6 +2090,7 @@ class FlightRecorderCollectiveProfiler:
                     "exact_process_group_name_and_collective_sequence"
                 ),
                 "megatron_collective_alias_bindings": self._megatron_alias_bindings,
+                "excluded_control_collectives": list(self._excluded_control_collectives),
                 "outstanding_async_work_count": 0,
                 "rank_local_logical_input_bytes": total_bytes,
                 "flight_rank_local_logical_input_bytes": total_flight_bytes,
@@ -2030,6 +2119,7 @@ class FlightRecorderCollectiveProfiler:
             self._begin_version = None
             self._begin_nccl_version = None
             self._observed_calls = []
+            self._excluded_control_collectives = []
             self._next_call_id = 0
             self._frozen_outer_id = None
             self._frozen_boundary_trace = None

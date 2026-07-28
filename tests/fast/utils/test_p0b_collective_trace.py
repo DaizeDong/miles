@@ -48,9 +48,9 @@ class FakeWork:
 
 
 class FakeGroup:
-    group_name = "0"
-
-    def __init__(self):
+    def __init__(self, name="0", backend="nccl"):
+        self.group_name = name
+        self.backend = backend
         self.sequence = 0
 
     def _get_sequence_number_for_group(self):
@@ -99,6 +99,7 @@ class FakeTensor:
 class FakeDistributed:
     def __init__(self):
         self.group = FakeGroup()
+        self.gloo_group = FakeGroup(name="gloo-control", backend="gloo")
         self.async_work = FakeWork()
         self.distributed_c10d = self
 
@@ -129,6 +130,22 @@ class FakeDistributed:
         return None
 
     def monitored_barrier(self, *args, **kwargs):
+        return None
+
+    def gather(self, *args, **kwargs):
+        self._call_group(args, kwargs, 3).sequence += 1
+        return None
+
+    @staticmethod
+    def get_backend(group):
+        return group.backend
+
+    def gather_object(self, *args, **kwargs):
+        group = self._call_group(args, kwargs, 3)
+        # Mirror the high-level object's private tensor lowering.  The P0-B
+        # Gloo-control wrapper must guard this wrapped tensor API so it is not
+        # misclassified as an accelerator tensor collective.
+        self.gather(FakeTensor([2]), dst=0, group=group)
         return None
 
 
@@ -773,6 +790,56 @@ def test_unsupported_collective_like_public_api_marks_outer_unavailable(tmp_path
     values = profiler.end_outer(3)
     assert values[0] is None and values[1] is None
     assert "unsupported object/P2P collective API" in values[2]["error_message"]
+
+
+def test_gloo_object_control_collective_is_explicitly_excluded(tmp_path):
+    entry = flight_entry(0)
+    profiler, fake_torch = profiler_for(
+        tmp_path, trace([]), boundary([entry]), trace([entry])
+    )
+    profiler.begin_outer(3)
+    fake_torch.distributed.gather_object(
+        {"metric": 1.0}, [None, None], dst=0,
+        group=fake_torch.distributed.gloo_group,
+    )
+    fake_torch.distributed.all_reduce(FakeTensor([4]))
+    assert profiler.freeze_outer_boundary(3)["available"] is True
+    collective_bytes, collective_time, evidence = profiler.end_outer(3)
+    assert collective_bytes == 16
+    assert collective_time == pytest.approx(0.00025)
+    exclusions = evidence["excluded_control_collectives"]
+    assert exclusions == [
+        {
+            "public_api": "gather_object",
+            "backend": "gloo",
+            "group_name": "gloo-control",
+            "group_size": 2,
+            "group_resolution": "direct_process_group",
+            "metric_inclusion": "excluded",
+            "reason": (
+                "verified CPU/Gloo object control collective outside the "
+                "accelerator tensor-collective byte/time metric"
+            ),
+        }
+    ]
+    trace_payload = json.loads(open(evidence["trace_path"], encoding="utf-8").read())
+    assert trace_payload["excluded_control_collectives"] == exclusions
+    profiler.begin_outer(4)
+    assert profiler._excluded_control_collectives == []
+    reset_values = profiler.end_outer(4)
+    assert reset_values[0] is None and reset_values[1] is None
+
+
+def test_object_collective_on_non_gloo_backend_fails_closed(tmp_path):
+    profiler, fake_torch = profiler_for(tmp_path, trace([]))
+    profiler.begin_outer(3)
+    fake_torch.distributed.gather_object(
+        {"metric": 1.0}, [None, None], dst=0,
+        group=fake_torch.distributed.group,
+    )
+    values = profiler.end_outer(3)
+    assert values[0] is None and values[1] is None
+    assert "backend must be exactly gloo" in values[2]["error_message"]
 
 
 def test_direct_process_group_flight_entry_without_public_binding_fails(tmp_path):
