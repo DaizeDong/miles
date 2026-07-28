@@ -96,18 +96,39 @@ class SnapshotProvider:
 
 
 class FakeCollectiveProfiler:
-    def __init__(self, *, logical_bytes=4096, time_seconds=0.25, available=True):
+    def __init__(
+        self,
+        *,
+        logical_bytes=4096,
+        time_seconds=0.25,
+        available=True,
+        events=None,
+    ):
         self.logical_bytes = logical_bytes
         self.time_seconds = time_seconds
         self.available = available
+        self.events = events
         self.begun = []
+        self.frozen = []
         self.ended = []
 
     def begin_outer(self, outer_id):
         self.begun.append(outer_id)
 
+    def freeze_outer_boundary(self, outer_id):
+        self.frozen.append(outer_id)
+        if self.events is not None:
+            self.events.append("collective_freeze")
+        return {
+            "available": self.available,
+            "outer_id": outer_id,
+            "record_id_set_frozen": True,
+        }
+
     def end_outer(self, outer_id):
         self.ended.append(outer_id)
+        if self.events is not None:
+            self.events.append("collective_finalize")
         evidence = {
             "available": self.available,
             "trace_path": f"/shared_nfs/unit/outer-{outer_id}.json",
@@ -164,12 +185,11 @@ def test_pinned_ray_reader_uses_fresh_global_reply_and_caches_state():
     fake_private = types.ModuleType("ray._private")
     fake_internal_api = types.ModuleType("ray._private.internal_api")
     fake_worker = types.ModuleType("ray._private.worker")
-    fake_worker.global_worker = types.SimpleNamespace(
-        gcs_client=types.SimpleNamespace(
-            address="127.0.0.1:6379",
-            cluster_id=types.SimpleNamespace(hex=lambda: "cluster-1"),
-        )
+    fake_gcs_client = types.SimpleNamespace(
+        address="127.0.0.1:6379",
+        cluster_id=types.SimpleNamespace(hex=lambda: "cluster-1"),
     )
+    fake_worker.global_worker = types.SimpleNamespace(gcs_client=fake_gcs_client)
     fake_internal_api.get_state_from_address = get_state_from_address
     fake_internal_api.get_memory_info_reply = get_memory_info_reply
     fake_private.internal_api = fake_internal_api
@@ -190,6 +210,14 @@ def test_pinned_ray_reader_uses_fresh_global_reply_and_caches_state():
         reader = _RayObjectStoreReader()
         assert reader()["object_store_bytes_used"] == 101
         assert reader()["spilled_bytes_total"] == 202
+        assert calls == {"state": 1, "reply": 2}
+        fake_gcs_client.address = "127.0.0.1:6380"
+        try:
+            reader()
+        except RuntimeError as exc:
+            assert "cached state identity drifted" in str(exc)
+        else:
+            raise AssertionError("cached Ray state accepted a changed GCS identity")
         assert calls == {"state": 1, "reply": 2}
     finally:
         for name, module in previous.items():
@@ -416,7 +444,53 @@ def test_measured_outer_emits_detail_and_exact_collector_schema():
     assert detail["schema_version"] == 2
     assert detail["profile_status"] == "complete"
     assert detail["unavailable"] == []
+    assert detail["required_observations"] == {
+        "rollout_payload": True,
+        "predictive_cache": True,
+        "completed_actor_steps": True,
+        "errors": [],
+    }
     assert snapshots.calls == 2
+
+
+def test_outer_close_freezes_collectives_then_captures_ray_before_finalize():
+    events = []
+
+    class OrderedSnapshots:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            events.append("ray_begin" if self.calls == 1 else "ray_end")
+            return ray_snapshot(
+                used=1000 + self.calls,
+                spilled=40,
+                captured_monotonic_ns=self.calls,
+            )
+
+    profiler = P0BSystemProfiler(
+        torch_module=FakeTorch,
+        rank=0,
+        world_size=8,
+        primary=True,
+        environ={"MILES_P0B_SYSTEM_PROFILE": "1", "MILES_P0B_MEASURED_OUTER_IDS": "3"},
+        output=lambda *args, **kwargs: None,
+        ray_snapshot_provider=OrderedSnapshots(),
+        collective_profiler=FakeCollectiveProfiler(events=events),
+    )
+    profiler.begin_outer(3)
+    profiler.observe_rollout_payload({"total_lengths": [8], "response_lengths": [4]})
+    profiler.observe_predictive_cache([])
+    profiler.observe_completed_actor_steps(4)
+    profiler.emit_outer()
+
+    assert events == [
+        "ray_begin",
+        "collective_freeze",
+        "ray_end",
+        "collective_finalize",
+    ]
 
 
 def test_ray_spill_counter_regression_is_unavailable_not_negative_or_zero():
@@ -591,9 +665,94 @@ def test_default_window_emits_exactly_ten_outers_and_resets_each_outer():
         profiler.observe_rollout_payload(
             {"tokens": [tensor], "total_lengths": [8], "response_lengths": [4]}
         )
+        profiler.observe_predictive_cache([])
+        profiler.observe_completed_actor_steps(4)
         profiler.emit_outer()
     system_lines = [line for line in lines if line.startswith("P0B_SYSTEM")]
     assert [int(line.split(" ", 2)[1].split("=", 1)[1]) for line in system_lines] == list(range(3, 13))
     assert FakeCuda.reset_calls == 13
     assert collective.begun == list(range(3, 13))
+    assert collective.frozen == list(range(3, 13))
     assert collective.ended == list(range(3, 13))
+
+
+def test_adjacent_outer_missing_hooks_cannot_reuse_prior_payload_or_pass_complete():
+    lines = []
+    profiler = P0BSystemProfiler(
+        torch_module=FakeTorch,
+        rank=0,
+        world_size=8,
+        primary=True,
+        environ={
+            "MILES_P0B_SYSTEM_PROFILE": "1",
+            "MILES_P0B_MEASURED_OUTER_IDS": "3,4",
+        },
+        output=lambda *args, **kwargs: lines.append(args[0]),
+        ray_snapshot_provider=lambda: ray_snapshot(used=1000, spilled=40),
+        collective_profiler=FakeCollectiveProfiler(),
+    )
+    tensor = FakeTensor(pointer=77, storage_bytes=512, logical_bytes=256)
+
+    profiler.begin_outer(3)
+    profiler.observe_rollout_payload(
+        {"tokens": [tensor], "total_lengths": [8], "response_lengths": [4]}
+    )
+    profiler.observe_predictive_cache([])
+    profiler.observe_completed_actor_steps(4)
+    profiler.emit_outer()
+
+    profiler.begin_outer(4)
+    profiler.observe_predictive_cache([])
+    profiler.emit_outer()
+
+    details = [
+        json.loads(line.split(" ", 2)[2])
+        for line in lines
+        if line.startswith("P0B_DETAIL")
+    ]
+    systems = [
+        json.loads(line.split(" ", 2)[2])
+        for line in lines
+        if line.startswith("P0B_SYSTEM")
+    ]
+    assert systems[0]["rollout_payload_bytes"] == 512
+    assert details[0]["profile_status"] == "complete"
+    assert systems[1]["rollout_payload_bytes"] is None
+    assert details[1]["required_observations"] == {
+        "rollout_payload": False,
+        "predictive_cache": True,
+        "completed_actor_steps": False,
+        "errors": [],
+    }
+    assert details[1]["profile_status"] == "incomplete_evidence"
+    assert "rollout_payload" in details[1]["unavailable"]
+    assert "completed_actor_steps" in details[1]["unavailable"]
+
+
+def test_duplicate_required_observer_marks_profile_incomplete():
+    lines = []
+    profiler = P0BSystemProfiler(
+        torch_module=FakeTorch,
+        rank=0,
+        world_size=8,
+        primary=True,
+        environ={"MILES_P0B_SYSTEM_PROFILE": "1", "MILES_P0B_MEASURED_OUTER_IDS": "3"},
+        output=lambda *args, **kwargs: lines.append(args[0]),
+        ray_snapshot_provider=lambda: ray_snapshot(used=1000, spilled=40),
+        collective_profiler=FakeCollectiveProfiler(),
+    )
+    profiler.begin_outer(3)
+    profiler.observe_rollout_payload({"total_lengths": [], "response_lengths": []})
+    profiler.observe_rollout_payload({"total_lengths": [], "response_lengths": []})
+    profiler.observe_predictive_cache([])
+    profiler.observe_completed_actor_steps(4)
+    profiler.emit_outer()
+    detail = json.loads(lines[0].split(" ", 2)[2])
+    system = json.loads(lines[1].split(" ", 2)[2])
+    assert detail["profile_status"] == "incomplete_evidence"
+    assert detail["required_observations"]["errors"] == [
+        "observe_rollout_payload called more than once"
+    ]
+    assert system["rollout_payload_bytes"] is None
+    assert "required_observation_contract" in detail["unavailable"]
+    assert any(value is None for value in system.values())

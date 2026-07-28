@@ -167,6 +167,20 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     def name(self) -> str:
         return self.group.name()
 
+    def _p0b_current_process_group(self):
+        """Return the exact live inner PG used by patched dist collectives.
+
+        P0-B binds a public call to the flight recorder by the inner process
+        group's sequence number.  The outer reloadable wrapper has its own
+        ProcessGroup sequence state and therefore cannot provide that binding.
+        """
+
+        if self.group is None:
+            raise RuntimeError(
+                "ReloadableProcessGroup has no live inner process group"
+            )
+        return self.group
+
     def shutdown(self) -> None:
         if self.group is not None:
             self.group.shutdown()

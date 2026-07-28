@@ -52,6 +52,7 @@ class _RayObjectStoreReader:
 
     def __init__(self) -> None:
         self._state: Any = None
+        self._state_identity: tuple[str, str, str] | None = None
 
     def __call__(self) -> Mapping[str, Any]:
         import ray
@@ -70,14 +71,21 @@ class _RayObjectStoreReader:
         cluster_id = _runtime_identifier(getattr(gcs_client, "cluster_id", None))
         if cluster_id is None:
             raise RuntimeError("P0-B Ray snapshot cannot bind the live Ray cluster ID")
-        if self._state is None:
-            self._state = internal_api.get_state_from_address(gcs_address)
-        reply = internal_api.get_memory_info_reply(self._state)
-        stats = reply.store_stats
         context = ray.get_runtime_context()
         job_id = _runtime_identifier(context.get_job_id())
         if job_id is None:
             raise RuntimeError("P0-B Ray snapshot cannot bind the live Ray job ID")
+        live_identity = (gcs_address, cluster_id, job_id)
+        if self._state is None:
+            self._state = internal_api.get_state_from_address(gcs_address)
+            self._state_identity = live_identity
+        elif live_identity != self._state_identity:
+            raise RuntimeError(
+                "P0-B Ray cached state identity drifted: "
+                f"cached={self._state_identity!r} live={live_identity!r}"
+            )
+        reply = internal_api.get_memory_info_reply(self._state)
+        stats = reply.store_stats
         return {
             "object_store_bytes_used": stats.object_store_bytes_used,
             "spilled_bytes_total": stats.spilled_bytes_total,
@@ -338,6 +346,15 @@ def _sum_ints(values: Any) -> int | None:
         return None
 
 
+def _empty_payload_stats() -> dict[str, int]:
+    return {
+        "logical_bytes": 0,
+        "unique_storage_bytes": 0,
+        "tensor_count": 0,
+        "ndarray_count": 0,
+    }
+
+
 class P0BSystemProfiler:
     """Collect one measured outer on the primary Megatron training rank."""
 
@@ -379,13 +396,12 @@ class P0BSystemProfiler:
         self._collective_begin_error: dict[str, Any] | None = None
         self._outer_id: int | None = None
         self._detail: dict[str, Any] = {}
-        self._payload_stats: dict[str, int] = {
-            "logical_bytes": 0,
-            "unique_storage_bytes": 0,
-            "tensor_count": 0,
-            "ndarray_count": 0,
-        }
-        self._predictive_stats = dict(self._payload_stats)
+        self._payload_stats = _empty_payload_stats()
+        self._predictive_stats = _empty_payload_stats()
+        self._payload_observed = False
+        self._predictive_observed = False
+        self._completed_steps_observed = False
+        self._observation_errors: list[str] = []
 
     @property
     def enabled(self) -> bool:
@@ -397,6 +413,12 @@ class P0BSystemProfiler:
         self._outer_id = int(outer_id)
         self._ray_start = None
         self._collective_begin_error = None
+        self._payload_stats = _empty_payload_stats()
+        self._predictive_stats = _empty_payload_stats()
+        self._payload_observed = False
+        self._predictive_observed = False
+        self._completed_steps_observed = False
+        self._observation_errors = []
         self._detail = {
             "schema_version": _SCHEMA_VERSION,
             "profile_id": _PROFILE_ID,
@@ -463,6 +485,10 @@ class P0BSystemProfiler:
     def observe_rollout_payload(self, rollout_data: Any) -> None:
         if not self._enabled or self._outer_id is None:
             return
+        if self._payload_observed:
+            self._observation_errors.append("observe_rollout_payload called more than once")
+            return
+        self._payload_observed = True
         self._payload_stats = tensor_payload_stats(rollout_data, self._torch)
         total_lengths = rollout_data.get("total_lengths") if isinstance(rollout_data, Mapping) else None
         response_lengths = rollout_data.get("response_lengths") if isinstance(rollout_data, Mapping) else None
@@ -476,6 +502,10 @@ class P0BSystemProfiler:
     def observe_predictive_cache(self, microbatches: Any) -> None:
         if not self._enabled or self._outer_id is None:
             return
+        if self._predictive_observed:
+            self._observation_errors.append("observe_predictive_cache called more than once")
+            return
+        self._predictive_observed = True
         self._predictive_stats = tensor_payload_stats(microbatches, self._torch)
         selected = sum(int(getattr(item, "selected_total_tokens", 0)) for item in microbatches)
         original = sum(int(getattr(item, "original_total_tokens", 0)) for item in microbatches)
@@ -491,7 +521,17 @@ class P0BSystemProfiler:
 
         if not self._enabled or self._outer_id is None:
             return
+        if self._completed_steps_observed:
+            self._observation_errors.append(
+                "observe_completed_actor_steps called more than once"
+            )
+            return
+        self._completed_steps_observed = True
         count = int(num_steps_per_outer)
+        if count <= 0:
+            self._observation_errors.append(
+                f"completed actor step count must be positive, got {count}"
+            )
         first = self._outer_id * count
         self._detail["completed_actor_steps"] = {
             "count": count,
@@ -503,6 +543,28 @@ class P0BSystemProfiler:
             return
         outer_id = self._outer_id
         self.mark("outer_end_before_perf_log")
+        ray_end: dict[str, Any] | None = None
+        if outer_id in self._measured_outers:
+            # Freeze the exact collective record/call/Work set at the canonical
+            # outer boundary before any profiler work can retire a late async
+            # operation.  The freeze is dump-only: it must not poll, write, or
+            # wait on Work.  Capture the Ray end gauge immediately afterwards,
+            # before RSS/CUDA reads or collective retirement/serialization can
+            # perturb cluster-global object-store and spill state.
+            if self._collective_begin_error is None:
+                try:
+                    self._detail["collective_boundary_freeze"] = (
+                        self._collective_profiler.freeze_outer_boundary(outer_id)
+                    )
+                except Exception as exc:
+                    self._collective_begin_error = {
+                        "available": False,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc)[:512],
+                        "stage": "freeze_outer_boundary",
+                    }
+            ray_end = self._capture_ray_snapshot()
+
         rss, peak_rss = _proc_memory_bytes()
         accelerator = self._accelerator_memory()
         self._detail["process_memory_at_end"] = {
@@ -524,6 +586,18 @@ class P0BSystemProfiler:
         }
 
         if outer_id in self._measured_outers:
+            required_observations = {
+                "rollout_payload": self._payload_observed,
+                "predictive_cache": self._predictive_observed,
+                "completed_actor_steps": self._completed_steps_observed,
+            }
+            self._detail["required_observations"] = {
+                **required_observations,
+                "errors": list(self._observation_errors),
+            }
+            for name, observed in required_observations.items():
+                if not observed:
+                    self._detail["unavailable"].append(name)
             if self._collective_begin_error is None:
                 collective_bytes, collective_time_seconds, collective_evidence = (
                     self._collective_profiler.end_outer(outer_id)
@@ -537,7 +611,7 @@ class P0BSystemProfiler:
                 self._detail["unavailable"].append("collective_bytes")
             if collective_time_seconds is None:
                 self._detail["unavailable"].append("collective_time_seconds")
-            ray_end = self._capture_ray_snapshot()
+            assert ray_end is not None
             ray_object_store_bytes, ray_spill_bytes, ray_evidence = self._ray_outer_metrics(
                 self._ray_start, ray_end
             )
@@ -552,13 +626,31 @@ class P0BSystemProfiler:
                 "host_rss_bytes": peak_rss,
                 "ray_object_store_bytes": ray_object_store_bytes,
                 "ray_spill_bytes": ray_spill_bytes,
-                "rollout_payload_bytes": self._payload_stats["unique_storage_bytes"],
+                "rollout_payload_bytes": (
+                    self._payload_stats["unique_storage_bytes"]
+                    if self._payload_observed
+                    else None
+                ),
                 "collective_bytes": collective_bytes,
                 "collective_time_seconds": collective_time_seconds,
             }
+            observation_gate_complete = (
+                all(required_observations.values()) and not self._observation_errors
+            )
+            if not observation_gate_complete:
+                # A P0B_SYSTEM row may never remain fully numeric when any
+                # mandatory runtime hook is missing, duplicated, or invalid.
+                # Keep independent Ray/collective evidence in P0B_DETAIL, but
+                # make the rollout field explicitly unavailable so a generic
+                # table consumer cannot mistake this for a claim-ready row.
+                system["rollout_payload_bytes"] = None
+                self._detail["unavailable"].append("required_observation_contract")
             self._detail["profile_status"] = (
                 "complete"
-                if not any(system_value is None for system_value in system.values())
+                if (
+                    observation_gate_complete
+                    and not any(system_value is None for system_value in system.values())
+                )
                 else "incomplete_evidence"
             )
             compact = {key: value for key, value in self._detail.items()}
