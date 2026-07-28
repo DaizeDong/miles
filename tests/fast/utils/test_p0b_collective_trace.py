@@ -140,6 +140,10 @@ class FakeDistributed:
     def get_backend(group):
         return group.backend
 
+    @staticmethod
+    def get_process_group_ranks(group):
+        return list(range(group.size()))
+
     def gather_object(self, *args, **kwargs):
         group = self._call_group(args, kwargs, 3)
         # Mirror the high-level object's private tensor lowering.  The P0-B
@@ -338,6 +342,90 @@ def test_reloadable_process_group_binds_the_live_inner_sequence(tmp_path):
     assert payload["public_call_evidence"][0]["group_resolution"] == (
         "reloadable_current_inner_process_group"
     )
+
+
+def test_missing_retired_pg_config_binds_flight_name_to_live_runtime_ranks(tmp_path):
+    entry = flight_entry(0, sequence=1, shape=[4], duration_ms=0.25)
+    entry["pg_id"] = 47
+    entry["process_group"] = ["47", "reloaded_inner_pg"]
+    boundary_trace = boundary([entry])
+    boundary_trace["pg_config"] = {}
+    boundary_trace["pg_status"] = {}
+    retired_trace = trace([entry])
+    retired_trace["pg_config"] = {}
+    retired_trace["pg_status"] = {}
+    profiler, fake_torch = profiler_for(
+        tmp_path, trace([]), boundary_trace, retired_trace
+    )
+    fake_torch.distributed.group = FakeGroup(name="47")
+
+    profiler.begin_outer(3)
+    fake_torch.distributed.all_reduce(FakeTensor([4]))
+    frozen = profiler.freeze_outer_boundary(3)
+    assert frozen["available"] is True
+    collective_bytes, collective_seconds, evidence = profiler.end_outer(3)
+
+    assert collective_bytes == 16
+    assert collective_seconds == pytest.approx(0.00025)
+    assert evidence["available"] is True
+    payload = json.loads(open(evidence["trace_path"], encoding="utf-8").read())
+    call = payload["public_call_evidence"][0]
+    parsed = payload["entries"][0]
+    assert call["group_name"] == "47"
+    assert call["group_ranks"] == [0, 1]
+    assert call["flight_group_identity_source"] == (
+        "flight_entry_process_group_and_live_runtime_ranks"
+    )
+    assert call["flight_pg_config_available"] is False
+    assert parsed["group_identity_source"] == (
+        "flight_entry_process_group_and_live_runtime_ranks"
+    )
+    assert parsed["group_ranks"] == [0, 1]
+    assert parsed["flight_pg_config_available"] is False
+
+
+@pytest.mark.parametrize(
+    "process_group",
+    [None, [], ["47"], ["", "desc"], ["47", ""], [47, "desc"]],
+)
+def test_missing_pg_config_requires_exact_flight_process_group_schema(
+    tmp_path, process_group
+):
+    entry = flight_entry(0, sequence=1, shape=[4])
+    entry["pg_id"] = 47
+    entry["process_group"] = process_group
+    boundary_trace = boundary([entry])
+    boundary_trace["pg_config"] = {}
+    profiler, fake_torch = profiler_for(tmp_path, trace([]), boundary_trace)
+    fake_torch.distributed.group = FakeGroup(name="47")
+
+    profiler.begin_outer(3)
+    fake_torch.distributed.all_reduce(FakeTensor([4]))
+    frozen = profiler.freeze_outer_boundary(3)
+
+    assert frozen["available"] is False
+    assert "invalid process_group for pg_id=47" in frozen["error_message"]
+
+
+def test_missing_pg_config_rejects_name_bound_to_a_different_pg_id(tmp_path):
+    entry = flight_entry(0, sequence=1, shape=[4])
+    entry["pg_id"] = 47
+    entry["process_group"] = ["47", "retired"]
+    boundary_trace = boundary([entry])
+    boundary_trace["pg_config"] = {
+        "12": {"name": "47", "desc": "other", "ranks": "[0, 1]"}
+    }
+    profiler, fake_torch = profiler_for(tmp_path, trace([]), boundary_trace)
+    fake_torch.distributed.group = FakeGroup(name="47")
+
+    profiler.begin_outer(3)
+    fake_torch.distributed.all_reduce(FakeTensor([4]))
+    frozen = profiler.freeze_outer_boundary(3)
+
+    assert frozen["available"] is False
+    assert "belongs to config IDs ['12'], not missing pg_id=47" in frozen[
+        "error_message"
+    ]
 
 
 def test_torch_2_9_coalescing_transaction_aggregates_runtime_inputs_and_real_work(

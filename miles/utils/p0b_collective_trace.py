@@ -265,7 +265,8 @@ def _parse_group_identity(
     *,
     local_rank: int | None = None,
     world_size: int | None = None,
-) -> tuple[str, int]:
+    runtime_group_ranks: list[int] | None = None,
+) -> tuple[str, int | None, str]:
     pg_id = entry.get("pg_id")
     config = trace.get("pg_config")
     if (
@@ -275,28 +276,64 @@ def _parse_group_identity(
         or not isinstance(config, Mapping)
     ):
         raise CollectiveTraceError("flight trace lacks pg_id/pg_config")
+    process_group = entry.get("process_group")
+    if (
+        not isinstance(process_group, list)
+        or len(process_group) != 2
+        or any(not isinstance(value, str) or not value for value in process_group)
+    ):
+        raise CollectiveTraceError(
+            f"flight trace has invalid process_group for pg_id={pg_id}: {process_group!r}"
+        )
+    entry_name, entry_desc = process_group
     group = config.get(str(pg_id))
     if not isinstance(group, Mapping):
-        raise CollectiveTraceError(f"flight trace lacks config for pg_id={pg_id}")
-    name = group.get("name")
-    if not isinstance(name, str) or not name:
-        raise CollectiveTraceError(
-            f"flight trace lacks stable process-group name for pg_id={pg_id}: {name!r}"
+        conflicting_ids = [
+            key
+            for key, candidate in config.items()
+            if isinstance(candidate, Mapping) and candidate.get("name") == entry_name
+        ]
+        if conflicting_ids:
+            raise CollectiveTraceError(
+                f"flight trace process_group name {entry_name!r} belongs to config "
+                f"IDs {conflicting_ids!r}, not missing pg_id={pg_id}"
+            )
+        if runtime_group_ranks is None:
+            return entry_name, None, "flight_entry_process_group_name"
+        ranks = runtime_group_ranks
+        resolution = "flight_entry_process_group_and_live_runtime_ranks"
+    else:
+        name = group.get("name")
+        if not isinstance(name, str) or not name:
+            raise CollectiveTraceError(
+                f"flight trace lacks stable process-group name for pg_id={pg_id}: {name!r}"
+            )
+        desc = group.get("desc")
+        if entry_name != name or (isinstance(desc, str) and entry_desc != desc):
+            raise CollectiveTraceError(
+                f"flight entry/config process_group mismatch for pg_id={pg_id}: "
+                f"entry={process_group!r} config_name={name!r} config_desc={desc!r}"
+            )
+        matching_names = [
+            key
+            for key, candidate in config.items()
+            if isinstance(candidate, Mapping) and candidate.get("name") == name
+        ]
+        if matching_names != [str(pg_id)]:
+            raise CollectiveTraceError(
+                f"flight trace process-group name {name!r} is not uniquely bound to pg_id={pg_id}"
+            )
+        ranks_raw = group.get("ranks")
+        try:
+            ranks = ast.literal_eval(ranks_raw) if isinstance(ranks_raw, str) else ranks_raw
+        except (SyntaxError, ValueError) as exc:
+            raise CollectiveTraceError(f"invalid process-group ranks {ranks_raw!r}") from exc
+        entry_name = name
+        resolution = (
+            "flight_pg_config_and_live_runtime_ranks"
+            if runtime_group_ranks is not None
+            else "flight_pg_config"
         )
-    matching_names = [
-        key
-        for key, candidate in config.items()
-        if isinstance(candidate, Mapping) and candidate.get("name") == name
-    ]
-    if matching_names != [str(pg_id)]:
-        raise CollectiveTraceError(
-            f"flight trace process-group name {name!r} is not uniquely bound to pg_id={pg_id}"
-        )
-    ranks_raw = group.get("ranks")
-    try:
-        ranks = ast.literal_eval(ranks_raw) if isinstance(ranks_raw, str) else ranks_raw
-    except (SyntaxError, ValueError) as exc:
-        raise CollectiveTraceError(f"invalid process-group ranks {ranks_raw!r}") from exc
     if (
         not isinstance(ranks, list)
         or not ranks
@@ -315,7 +352,16 @@ def _parse_group_identity(
         raise CollectiveTraceError(
             f"local rank {local_rank} is absent from process-group ranks {ranks!r}"
         )
-    return name, len(ranks)
+    if (
+        runtime_group_ranks is not None
+        and len(ranks) == len(runtime_group_ranks)
+        and ranks != runtime_group_ranks
+    ):
+        raise CollectiveTraceError(
+            f"flight/runtime process-group ranks mismatch for pg_id={pg_id}: "
+            f"flight={ranks!r} runtime={runtime_group_ranks!r}"
+        )
+    return entry_name, len(ranks), resolution
 
 
 def _canonical_op(entry: Mapping[str, Any]) -> str:
@@ -978,6 +1024,34 @@ class FlightRecorderCollectiveProfiler:
             raise CollectiveTraceError(f"invalid runtime process-group size {value!r}")
         return value
 
+    def _group_ranks(self, group: Any, expected_size: int) -> list[int]:
+        function = getattr(
+            self._torch.distributed, "get_process_group_ranks", None
+        )
+        if not callable(function):
+            raise CollectiveTraceError(
+                "torch.distributed.get_process_group_ranks is unavailable"
+            )
+        value = function(group)
+        if (
+            not isinstance(value, list)
+            or len(value) != expected_size
+            or any(
+                isinstance(rank, bool)
+                or not isinstance(rank, int)
+                or rank < 0
+                or rank >= self._world_size
+                for rank in value
+            )
+            or len(value) != len(set(value))
+            or self._rank not in value
+        ):
+            raise CollectiveTraceError(
+                f"invalid live runtime process-group ranks {value!r} "
+                f"for size={expected_size} rank={self._rank} world_size={self._world_size}"
+            )
+        return list(value)
+
     @staticmethod
     def _resolve_runtime_group(group: Any) -> tuple[Any, str]:
         """Resolve a MILES reloadable wrapper to the PG actually enqueued.
@@ -1047,12 +1121,14 @@ class FlightRecorderCollectiveProfiler:
             raise CollectiveTraceError(
                 f"coalescing manager async_ops must be bool, got {async_ops!r}"
             )
+        group_size = self._group_size(runtime_group)
         return {
             "manager_group": manager_group,
             "runtime_group": runtime_group,
             "group_resolution": group_resolution,
             "group_name": self._group_name(runtime_group),
-            "group_size": self._group_size(runtime_group),
+            "group_size": group_size,
+            "group_ranks": self._group_ranks(runtime_group, group_size),
             "sequence_before": self._group_sequence(runtime_group),
             "async_ops": async_ops,
             "observed_call_count_before": len(self._observed_calls),
@@ -1180,6 +1256,7 @@ class FlightRecorderCollectiveProfiler:
             "group": transaction["runtime_group"],
             "group_name": transaction["group_name"],
             "group_size": transaction["group_size"],
+            "group_ranks": transaction["group_ranks"],
             "group_resolution": transaction["group_resolution"],
             "sequence_before": transaction["sequence_before"],
             "runtime_rank_local_logical_input_bytes": transaction[
@@ -1215,6 +1292,7 @@ class FlightRecorderCollectiveProfiler:
         )
         call_id = self._next_call_id
         self._next_call_id += 1
+        group_size = self._group_size(group)
         return {
             "call_id": call_id,
             "public_api": name,
@@ -1222,7 +1300,8 @@ class FlightRecorderCollectiveProfiler:
             "expected_low_level_ops": spec.expected_low_level_ops,
             "group": group,
             "group_name": self._group_name(group),
-            "group_size": self._group_size(group),
+            "group_size": group_size,
+            "group_ranks": self._group_ranks(group, group_size),
             "group_resolution": group_resolution,
             "sequence_before": self._group_sequence(group),
             "runtime_rank_local_logical_input_bytes": logical_bytes,
@@ -1531,7 +1610,7 @@ class FlightRecorderCollectiveProfiler:
             )
         flight_by_key: dict[tuple[str, int], dict[str, Any]] = {}
         for entry in entries:
-            group_name, _ = _parse_group_identity(
+            group_name, _, _ = _parse_group_identity(
                 trace,
                 entry,
                 local_rank=self._rank,
@@ -1575,11 +1654,12 @@ class FlightRecorderCollectiveProfiler:
                     f"public call_id={call['call_id']} runtime/flight byte mismatch: "
                     f"runtime={runtime_logical_bytes} flight={flight_logical_bytes}"
                 )
-            _, flight_group_size = _parse_group_identity(
+            _, flight_group_size, group_identity_source = _parse_group_identity(
                 trace,
                 entry,
                 local_rank=self._rank,
                 world_size=self._world_size,
+                runtime_group_ranks=call["group_ranks"],
             )
             if flight_group_size != call["group_size"]:
                 raise CollectiveTraceError(
@@ -1592,7 +1672,11 @@ class FlightRecorderCollectiveProfiler:
                 "async_op": call["async_op"],
                 "group_name": call["group_name"],
                 "group_size": call["group_size"],
+                "group_ranks": call["group_ranks"],
                 "group_resolution": call["group_resolution"],
+                "flight_group_identity_source": group_identity_source,
+                "flight_pg_config_available": flight_group_size is not None
+                and str(entry.get("pg_id")) in trace.get("pg_config", {}),
                 "sequence_before": call["sequence_before"],
                 "collective_seq_id": call["sequence_after"],
                 "flight_record_id": entry["record_id"],
@@ -1910,17 +1994,22 @@ class FlightRecorderCollectiveProfiler:
                         f"flight trace record {entry['record_id']} has invalid duration {duration!r}"
                     )
                 logical_bytes, tensors = _entry_input_bytes(entry, op)
-                group_name, group_size = _parse_group_identity(
+                call_binding = call_binding_by_record_id[entry["record_id"]]
+                group_name, group_size, group_identity_source = _parse_group_identity(
                     trace,
                     entry,
                     local_rank=self._rank,
                     world_size=self._world_size,
+                    runtime_group_ranks=call_binding["group_ranks"],
                 )
+                if group_size is None:
+                    raise CollectiveTraceError(
+                        f"flight record {entry['record_id']} lacks resolved process-group size"
+                    )
                 if group_size > self._world_size:
                     raise CollectiveTraceError(
                         f"process-group size {group_size} exceeds world_size={self._world_size}"
                     )
-                call_binding = call_binding_by_record_id[entry["record_id"]]
                 runtime_logical_bytes = call_binding[
                     "runtime_rank_local_logical_input_bytes"
                 ]
@@ -1938,6 +2027,10 @@ class FlightRecorderCollectiveProfiler:
                         "process_group": entry.get("process_group"),
                         "group_name": group_name,
                         "group_size": group_size,
+                        "group_ranks": call_binding["group_ranks"],
+                        "group_identity_source": group_identity_source,
+                        "flight_pg_config_available": str(entry.get("pg_id"))
+                        in trace.get("pg_config", {}),
                         "operation": op,
                         "rank_local_logical_input_bytes": runtime_logical_bytes,
                         "runtime_input_tensors": call_binding[
