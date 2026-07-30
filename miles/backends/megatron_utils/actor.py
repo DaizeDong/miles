@@ -502,6 +502,84 @@ class MegatronTrainRayActor(TrainRayActor):
                                 int(getattr(microbatch, "original_total_tokens", 0))
                                 for microbatch in predictive_microbatches
                             )
+                            if bool(getattr(self.args, "predictive_paper_cache", False)):
+                                valid_predictive_microbatches = [
+                                    microbatch
+                                    for microbatch in predictive_microbatches
+                                    if bool(getattr(microbatch, "has_valid_samples", False))
+                                ]
+                                selected_response_lengths = [
+                                    int(length)
+                                    for microbatch in valid_predictive_microbatches
+                                    for length in getattr(microbatch, "selected_sample_lengths", [])
+                                ]
+                                hidden_dtypes = sorted(
+                                    {
+                                        str(microbatch.old_inputs_concat.dtype)
+                                        for microbatch in valid_predictive_microbatches
+                                    }
+                                )
+                                logits_dtypes = sorted(
+                                    {
+                                        str(microbatch.old_logits_concat.dtype)
+                                        for microbatch in valid_predictive_microbatches
+                                    }
+                                )
+                                unit_loss_scale = all(
+                                    float(getattr(microbatch, "predictive_loss_scale", 0.0)) == 1.0
+                                    for microbatch in predictive_microbatches
+                                )
+                                token_accounting_exact = all(
+                                    int(getattr(microbatch, "selected_total_tokens", 0))
+                                    == sum(
+                                        int(length)
+                                        for length in getattr(microbatch, "selected_sample_lengths", [])
+                                    )
+                                    for microbatch in predictive_microbatches
+                                )
+                                paper_cache_contract_ok = (
+                                    getattr(self.args, "predictive_cache_sampling_mode", None)
+                                    == "response-uniform"
+                                    and int(getattr(self.args, "predictive_response_cache_tokens", 0)) == 2048
+                                    and hidden_dtypes == ["torch.bfloat16"]
+                                    and logits_dtypes == ["torch.float32"]
+                                    and bool(selected_response_lengths)
+                                    and max(selected_response_lengths) <= 2048
+                                    and unit_loss_scale
+                                    and token_accounting_exact
+                                    and 0 < selected_tokens <= original_tokens
+                                )
+                                if is_megatron_main_rank():
+                                    logger.info(
+                                        "[PR2_VALIDATE] paper_feature_cache_contract rollout=%s mode=%s "
+                                        "response_cache_tokens=%s cached_responses=%s max_selected_per_response=%s "
+                                        "hidden_dtypes=%s logits_dtypes=%s unit_loss_scale=%s "
+                                        "token_accounting_exact=%s selected_tokens=%s original_tokens=%s pass=%s",
+                                        rollout_id,
+                                        getattr(self.args, "predictive_cache_sampling_mode", None),
+                                        getattr(self.args, "predictive_response_cache_tokens", None),
+                                        len(selected_response_lengths),
+                                        max(selected_response_lengths, default=0),
+                                        hidden_dtypes,
+                                        logits_dtypes,
+                                        unit_loss_scale,
+                                        token_accounting_exact,
+                                        selected_tokens,
+                                        original_tokens,
+                                        paper_cache_contract_ok,
+                                    )
+                                if not paper_cache_contract_ok:
+                                    raise RuntimeError(
+                                        "[PR2_VALIDATE] Appendix-E.1 feature cache runtime contract failed: "
+                                        f"mode={getattr(self.args, 'predictive_cache_sampling_mode', None)}, "
+                                        f"Tc={getattr(self.args, 'predictive_response_cache_tokens', None)}, "
+                                        f"hidden_dtypes={hidden_dtypes}, logits_dtypes={logits_dtypes}, "
+                                        f"cached_responses={len(selected_response_lengths)}, "
+                                        f"max_selected_per_response={max(selected_response_lengths, default=0)}, "
+                                        f"unit_loss_scale={unit_loss_scale}, "
+                                        f"token_accounting_exact={token_accounting_exact}, "
+                                        f"selected_tokens={selected_tokens}, original_tokens={original_tokens}"
+                                    )
                             if is_megatron_main_rank():
                                 logger.info(
                                     "[PR2_VALIDATE] feature_cache_recorded rollout=%s buffered=%s expected=%s "
