@@ -342,6 +342,8 @@ def _collect_recorded_predictive_microbatch(
         pack_recorded_predictive_microbatch(
             recorded_old_inputs=recorded_old_inputs,
             recorded_old_logits=recorded_old_logits,
+            packed_sample_ids=batch.get("predictive_sample_ids"),
+            packed_token_positions=batch.get("predictive_token_positions"),
             total_lengths=batch["total_lengths"],
             parallel_state=parallel_state,
             qkv_format=args.qkv_format,
@@ -494,6 +496,7 @@ def forward_only(
         ]
         if record_router_logits:
             batch_keys.append("global_token_ids")
+        if predictive_router_enabled or record_router_logits:
             batch_keys.append("sample_indices")
         batch = get_batch(
             data_iterator,
@@ -502,20 +505,42 @@ def forward_only(
             args.qkv_format,
             allgather_cp=args.allgather_cp,
         )
+        if predictive_router_enabled and (
+            batch.get("sample_indices") is None
+            or batch.get("predictive_sample_ids") is None
+            or batch.get("predictive_token_positions") is None
+        ):
+            raise RuntimeError(
+                "P2-A/PR2 RECORD requires Sample.index-derived sample_indices and packed token coordinates."
+            )
         unconcat_tokens = batch["unconcat_tokens"]
         tokens = batch["tokens"]
         packed_seq_params = get_packed_seq_params(batch, args)
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
-        output_tensor = model(
-            input_ids=tokens,
-            position_ids=None,
-            attention_mask=None,
-            labels=None,
-            packed_seq_params=packed_seq_params,
-            loss_mask=batch["full_loss_masks"],
-            **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
+        predictive_controller = get_predictive_replay_controller()
+        publish_p2a_coordinates = (
+            predictive_router_enabled
+            and PredictiveRouterReplayState.get_global_predictive_action() == RouterPredictiveAction.RECORD
         )
+        if publish_p2a_coordinates:
+            predictive_controller.set_current_token_coordinates(
+                sample_ids=batch["predictive_sample_ids"],
+                token_positions=batch["predictive_token_positions"],
+            )
+        try:
+            output_tensor = model(
+                input_ids=tokens,
+                position_ids=None,
+                attention_mask=None,
+                labels=None,
+                packed_seq_params=packed_seq_params,
+                loss_mask=batch["full_loss_masks"],
+                **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
+            )
+        finally:
+            if publish_p2a_coordinates:
+                predictive_controller.clear_current_token_coordinates()
         if record_router_logits:
             _maybe_record_global_token_ids(batch)
 

@@ -75,6 +75,7 @@ def get_model_provider_func(
             hidden_size=getattr(args, "bias_predictor_hidden_size", 64),
             route_noise_std=getattr(args, "predictive_route_noise_std", 0.0),
             route_noise_seed=getattr(args, "predictive_route_noise_seed", 42),
+            route_noise_scale_path=getattr(args, "predictive_route_noise_scale_path", None),
             layer_scale_schedule=getattr(args, "predictive_layer_scale_schedule", "none"),
             layer_scale_min=getattr(args, "predictive_layer_scale_min", 1.0),
             boundary_loss_max_weight=getattr(args, "predictive_boundary_loss_max_weight", None),

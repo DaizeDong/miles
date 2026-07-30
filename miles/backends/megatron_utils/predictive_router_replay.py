@@ -17,8 +17,8 @@ synthetic-loss sync) live in
 and are re-exported here so existing callers can keep importing from
 this module.
 """
-import hashlib
 import inspect
+import json
 import logging
 import os
 from contextlib import contextmanager
@@ -176,6 +176,12 @@ def apply_predictive_route_noise(
     effective_logits: torch.Tensor,
     noise_std: float,
     noise_seed: int,
+    layer_scale: float,
+    sample_ids: torch.Tensor,
+    token_positions: torch.Tensor,
+    outer_step: int,
+    mini_step: int,
+    layer_idx: int,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Apply the rebuttal's deterministic, RECORD-only hard-route intervention.
 
@@ -191,24 +197,130 @@ def apply_predictive_route_noise(
             "predictive_route_noise_abs_mean": 0.0,
         }
 
-    detached_logits = effective_logits.detach().float()
-    per_token_scale = detached_logits.std(dim=-1, unbiased=False)
-    route_scale = per_token_scale.median()
+    if not torch.isfinite(torch.tensor(float(layer_scale))) or float(layer_scale) < 1e-6:
+        raise ValueError(f"P2-A frozen layer scale must be finite and >= 1e-6, got {layer_scale}")
 
-    generator = torch.Generator(device=effective_logits.device)
-    generator.manual_seed(int(noise_seed))
-    standard_noise = torch.randn(
-        effective_logits.shape,
-        dtype=torch.float32,
-        device=effective_logits.device,
-        generator=generator,
+    num_experts = effective_logits.shape[-1]
+    flat_logits = effective_logits.reshape(-1, num_experts)
+    sample_ids = sample_ids.detach().to(device=effective_logits.device, dtype=torch.int64).reshape(-1)
+    token_positions = token_positions.detach().to(device=effective_logits.device, dtype=torch.int64).reshape(-1)
+    if sample_ids.numel() != flat_logits.shape[0] or token_positions.numel() != flat_logits.shape[0]:
+        raise RuntimeError(
+            "P2-A stable-noise coordinates do not align with router logits: "
+            f"sample_ids={sample_ids.numel()} token_positions={token_positions.numel()} "
+            f"router_tokens={flat_logits.shape[0]}"
+        )
+
+    standard_noise = build_stable_predictive_gaussian_field(
+        seed=int(noise_seed),
+        sample_ids=sample_ids,
+        token_positions=token_positions,
+        outer_step=int(outer_step),
+        mini_step=int(mini_step),
+        layer_idx=int(layer_idx),
+        num_experts=num_experts,
     )
-    scaled_noise = standard_noise * (float(noise_std) * route_scale)
+    scaled_noise = standard_noise * (float(noise_std) * float(layer_scale))
+    scaled_noise = scaled_noise.reshape(effective_logits.shape)
     noisy_logits = effective_logits + scaled_noise.to(dtype=effective_logits.dtype)
     return noisy_logits, {
-        "predictive_route_noise_scale": float((float(noise_std) * route_scale).item()),
+        "predictive_route_noise_scale": float(noise_std) * float(layer_scale),
         "predictive_route_noise_abs_mean": float(scaled_noise.abs().mean().item()),
     }
+
+
+_P2A_HASH_MODULUS = 2_147_483_647
+
+
+def _p2a_coordinate_hash(
+    *,
+    seed: int,
+    sample_ids: torch.Tensor,
+    token_positions: torch.Tensor,
+    outer_step: int,
+    mini_step: int,
+    layer_idx: int,
+    experts: torch.Tensor,
+    stream: int,
+) -> torch.Tensor:
+    """Counter-style integer hash used by the frozen P2-A noise field.
+
+    The arithmetic stays below signed-int64 overflow and contains no local
+    rank, microbatch, packing, or call-order term.
+    """
+    modulus = _P2A_HASH_MODULUS
+    shape = torch.broadcast_shapes(sample_ids.shape, token_positions.shape, experts.shape)
+    hashed = torch.full(shape, 104_729 + 65_537 * int(stream), dtype=torch.int64, device=sample_ids.device)
+    coordinate_terms = (
+        (int(seed), 1_000_003),
+        (sample_ids, 1_000_033),
+        (token_positions, 1_000_037),
+        (int(outer_step), 1_000_081),
+        (int(mini_step), 1_000_099),
+        (int(layer_idx), 1_000_117),
+        (experts, 1_000_121),
+    )
+    for value, coefficient in coordinate_terms:
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value, dtype=torch.int64, device=sample_ids.device)
+        value = torch.remainder(value.to(dtype=torch.int64), modulus)
+        hashed = torch.remainder(hashed * 48_271 + value * coefficient + 1, modulus)
+    return hashed
+
+
+def build_stable_predictive_gaussian_field(
+    *,
+    seed: int,
+    sample_ids: torch.Tensor,
+    token_positions: torch.Tensor,
+    outer_step: int,
+    mini_step: int,
+    layer_idx: int,
+    num_experts: int,
+) -> torch.Tensor:
+    """Return the frozen N(0,1) field for stable P2-A coordinates."""
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    sample_ids = sample_ids.reshape(-1, 1).to(torch.int64)
+    token_positions = token_positions.reshape(-1, 1).to(device=sample_ids.device, dtype=torch.int64)
+    experts = torch.arange(num_experts, dtype=torch.int64, device=sample_ids.device).reshape(1, -1)
+    first = _p2a_coordinate_hash(
+        seed=seed,
+        sample_ids=sample_ids,
+        token_positions=token_positions,
+        outer_step=outer_step,
+        mini_step=mini_step,
+        layer_idx=layer_idx,
+        experts=experts,
+        stream=0,
+    )
+    second = _p2a_coordinate_hash(
+        seed=seed,
+        sample_ids=sample_ids,
+        token_positions=token_positions,
+        outer_step=outer_step,
+        mini_step=mini_step,
+        layer_idx=layer_idx,
+        experts=experts,
+        stream=1,
+    )
+    # Box-Muller in float64, then one explicit float32 rounding.  Invalid
+    # padding coordinates receive zero intervention and are excluded by audits.
+    uniform_one = (first.to(torch.float64) + 0.5) / float(_P2A_HASH_MODULUS)
+    uniform_two = (second.to(torch.float64) + 0.5) / float(_P2A_HASH_MODULUS)
+    gaussian = torch.sqrt(-2.0 * torch.log(uniform_one)) * torch.cos(2.0 * torch.pi * uniform_two)
+    valid = (sample_ids >= 0) & (token_positions >= 0)
+    return torch.where(valid, gaussian, torch.zeros_like(gaussian)).to(torch.float32)
+
+
+def load_frozen_predictive_route_layer_scales(scale_path: str | None) -> dict[int, float]:
+    if scale_path is None:
+        return {}
+    with open(scale_path, encoding="utf-8") as scale_file:
+        payload = json.load(scale_file)
+    if payload.get("schema") != "pr2.p2a.frozen-layer-scales.v1":
+        raise RuntimeError("P2-A route-noise scale file has an unsupported schema.")
+    return {int(layer_idx): max(float(scale), 1e-6) for layer_idx, scale in payload["layer_scales"].items()}
 
 
 def calculate_routing_map_topk_accuracy(
@@ -239,6 +351,7 @@ def initialize_predictive_router_modules(
     hidden_size: int = 64,
     route_noise_std: float = 0.0,
     route_noise_seed: int = 42,
+    route_noise_scale_path: str | None = None,
     layer_scale_schedule: str = "none",
     layer_scale_min: float = 1.0,
     boundary_loss_max_weight: float | None = None,
@@ -247,6 +360,8 @@ def initialize_predictive_router_modules(
     from megatron.core.transformer.moe.router import TopKRouter
 
     PredictiveRouterReplayState.reset_registry()
+    route_noise_layer_scales = load_frozen_predictive_route_layer_scales(route_noise_scale_path)
+    seen_global_layer_indices: set[int] = set()
 
     seen_modules = set()
     for module_chunk in _iter_module_chunks(model_chunks):
@@ -275,7 +390,28 @@ def initialize_predictive_router_modules(
                     submodule.bias_predictor = None
                 continue
 
-            PredictiveRouterReplayState.register_router(submodule)
+            predictive_state = PredictiveRouterReplayState.register_router(submodule)
+            global_layer_idx = getattr(submodule, "layer_number", None)
+            if global_layer_idx is None:
+                if route_noise_std > 0:
+                    raise RuntimeError("P2-A route noise requires a globally stable TopKRouter.layer_number.")
+                global_layer_idx = predictive_state.layer_idx
+            global_layer_idx = int(global_layer_idx)
+            if global_layer_idx < 0 or global_layer_idx in seen_global_layer_indices:
+                raise RuntimeError(
+                    f"P2-A router layer identity must be non-negative and globally unique on each rank: "
+                    f"layer={global_layer_idx} seen={sorted(seen_global_layer_indices)}"
+                )
+            seen_global_layer_indices.add(global_layer_idx)
+            predictive_state.global_layer_idx = global_layer_idx
+            if route_noise_std > 0 and global_layer_idx not in route_noise_layer_scales:
+                raise RuntimeError(
+                    f"Frozen P2-A scale file has no scale for global router layer {global_layer_idx}."
+                )
+            submodule.config.predictive_route_noise_layer_scale = route_noise_layer_scales.get(
+                global_layer_idx,
+                1.0,
+            )
             submodule.bias_predictor = _build_bias_predictor(
                 submodule,
                 architecture=architecture,
@@ -492,14 +628,21 @@ def apply_predictive_router_replay_patch() -> None:
                 route_noise_std = float(getattr(self.config, "predictive_route_noise_std", 0.0))
                 routing_logits = effective_logits
                 if route_noise_std > 0:
-                    route_noise_seed = predictive_controller.next_record_noise_seed(
-                        base_seed=int(getattr(self.config, "predictive_route_noise_seed", 42)),
-                        layer_idx=predictive_state.layer_idx,
-                    )
+                    sample_ids, token_positions = predictive_controller.get_current_token_coordinates()
+                    if sample_ids is None or token_positions is None:
+                        raise RuntimeError(
+                            "P2-A route noise requires stable sample-id/token-position coordinates in RECORD mode."
+                        )
                     routing_logits, route_noise_metrics = apply_predictive_route_noise(
                         effective_logits=effective_logits,
                         noise_std=route_noise_std,
-                        noise_seed=route_noise_seed,
+                        noise_seed=int(getattr(self.config, "predictive_route_noise_seed", 42)),
+                        layer_scale=float(getattr(self.config, "predictive_route_noise_layer_scale")),
+                        sample_ids=sample_ids,
+                        token_positions=token_positions,
+                        outer_step=int(predictive_controller.require_current_outer_step()),
+                        mini_step=int(predictive_controller.require_current_mini_step()),
+                        layer_idx=predictive_state.global_layer_idx,
                     )
                     route_noise_metrics["predictive_route_noise_clean_overlap"] = calculate_topk_accuracy(
                         topk=self.topk,
@@ -629,7 +772,7 @@ def apply_predictive_router_replay_patch() -> None:
                     current_logits.shape[0],
                 )
             PredictiveRouterReplayState.record_predictive_metric_tensors(
-                layer_idx=predictive_state.layer_idx,
+                layer_idx=predictive_state.global_layer_idx,
                 old_inputs=old_inputs,
                 current_inputs=current_inputs,
                 old_logits=old_logits,
@@ -658,6 +801,11 @@ def predictive_action_scope(
     controller = get_predictive_replay_controller()
     previous_rollout_id = controller.current_rollout_id
     previous_step_id = controller.current_step_id
+    if action == RouterPredictiveAction.RECORD and rollout_id is not None and step_id is None:
+        # PR2 selects the support once, before the off-policy update loop, and
+        # replays it in every later mini-step.  Publish that selection stage as
+        # an explicit mini-step zero rather than silently coercing None.
+        step_id = 0
     if rollout_id is not None or step_id is not None:
         controller.set_current_step_context(rollout_id=rollout_id, step_id=step_id)
     if action == RouterPredictiveAction.RECORD:
@@ -755,7 +903,8 @@ class PredictiveReplayController:
         self.current_rollout_id: int | None = None
         self.current_step_id: int | None = None
         self.record_round = -1
-        self.record_noise_call_counts: dict[int, int] = {}
+        self.current_token_sample_ids: torch.Tensor | None = None
+        self.current_token_positions: torch.Tensor | None = None
         self.microbatches: list[object] = []
         self.train_index = 0
         self.used_valid_predictive_data = False
@@ -776,9 +925,8 @@ class PredictiveReplayController:
         self.current_step_id = None
 
     def begin_recording_round(self) -> None:
-        """Start one deterministic RECORD round and reset per-layer call order."""
+        """Start one RECORD round; P2-A randomness is coordinate keyed."""
         self.record_round += 1
-        self.record_noise_call_counts.clear()
 
     @staticmethod
     def _get_data_parallel_rank() -> int:
@@ -791,23 +939,41 @@ class PredictiveReplayController:
         except Exception:
             return int(dist.get_rank())
 
-    def next_record_noise_seed(self, *, base_seed: int, layer_idx: int) -> int:
-        """Derive a stable seed without relying on Python's salted ``hash``."""
-        call_index = self.record_noise_call_counts.get(layer_idx, 0)
-        self.record_noise_call_counts[layer_idx] = call_index + 1
-        if self.current_rollout_id is None:
-            round_key = f"record:{self.record_round}"
-        else:
-            round_key = f"rollout:{self.current_rollout_id}"
-        payload = (
-            f"{int(base_seed)}:{round_key}:{self._get_data_parallel_rank()}:"
-            f"{int(layer_idx)}:{call_index}"
-        ).encode("ascii")
-        digest = hashlib.blake2b(payload, digest_size=8, person=b"miles-pr2").digest()
-        return int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1)
+    def set_current_token_coordinates(
+        self,
+        *,
+        sample_ids: torch.Tensor,
+        token_positions: torch.Tensor,
+    ) -> None:
+        sample_ids = sample_ids.detach().reshape(-1)
+        token_positions = token_positions.detach().reshape(-1)
+        if sample_ids.numel() != token_positions.numel():
+            raise ValueError(
+                "P2-A sample-id/token-position coordinate lengths differ: "
+                f"{sample_ids.numel()} != {token_positions.numel()}"
+            )
+        self.current_token_sample_ids = sample_ids
+        self.current_token_positions = token_positions
+
+    def get_current_token_coordinates(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.current_token_sample_ids, self.current_token_positions
+
+    def clear_current_token_coordinates(self) -> None:
+        self.current_token_sample_ids = None
+        self.current_token_positions = None
 
     def get_current_rollout_id(self) -> int | None:
         return self.current_rollout_id
+
+    def require_current_outer_step(self) -> int:
+        if self.current_rollout_id is None:
+            raise RuntimeError("P2-A stable-noise RECORD mode requires an explicit outer_step.")
+        return int(self.current_rollout_id)
+
+    def require_current_mini_step(self) -> int:
+        if self.current_step_id is None:
+            raise RuntimeError("P2-A stable-noise RECORD mode requires an explicit mini_step.")
+        return int(self.current_step_id)
 
     def register_router(self, router, attr_name: str = "predictive_router_replay") -> "PredictiveRouterReplayState":
         state = PredictiveRouterReplayState(controller=self)
@@ -825,7 +991,7 @@ class PredictiveReplayController:
         self.clear_predictive_metric_tensors()
         self.clear_current_step_context()
         self.record_round = -1
-        self.record_noise_call_counts.clear()
+        self.clear_current_token_coordinates()
 
     def add_router_state(self, state: "PredictiveRouterReplayState") -> None:
         self.router_states.append(state)
@@ -852,6 +1018,7 @@ class PredictiveReplayController:
     def clear_global_predictive_data(self) -> None:
         for router in self.router_states:
             router.clear_predictive_data()
+        self.clear_current_token_coordinates()
 
     def set_global_predictive_data(
         self,
@@ -860,10 +1027,27 @@ class PredictiveReplayController:
         old_logits_concat: torch.Tensor | None,
         valid_mask: torch.Tensor | None,
         loss_scale: float = 1.0,
+        sample_ids_concat: torch.Tensor | None = None,
+        token_positions_concat: torch.Tensor | None = None,
     ) -> None:
         if old_inputs_concat is None or old_logits_concat is None:
             self.clear_global_predictive_data()
             return
+        if (sample_ids_concat is None) != (token_positions_concat is None):
+            raise ValueError("Predictive token sample ids and positions must be provided together.")
+        if sample_ids_concat is not None:
+            if sample_ids_concat.numel() != old_inputs_concat.shape[0] or token_positions_concat.numel() != old_inputs_concat.shape[0]:
+                raise ValueError(
+                    "Predictive token coordinates must align with selected predictive tokens: "
+                    f"sample_ids={sample_ids_concat.numel()} positions={token_positions_concat.numel()} "
+                    f"tokens={old_inputs_concat.shape[0]}"
+                )
+            self.set_current_token_coordinates(
+                sample_ids=sample_ids_concat,
+                token_positions=token_positions_concat,
+            )
+        else:
+            self.clear_current_token_coordinates()
 
         if old_inputs_concat.ndim != 3 or old_logits_concat.ndim != 3:
             raise ValueError("Predictive tensors must have shape [num_tokens, num_layers, hidden_or_experts].")
@@ -925,6 +1109,8 @@ class PredictiveReplayController:
                     old_logits_concat=predictive_microbatch.old_logits_concat,
                     valid_mask=predictive_microbatch.valid_mask,
                     loss_scale=predictive_microbatch.predictive_loss_scale,
+                    sample_ids_concat=predictive_microbatch.sample_ids_concat,
+                    token_positions_concat=predictive_microbatch.token_positions_concat,
                 )
                 self.set_global_predictive_action(RouterPredictiveAction.COMPUTE_PREDICTIVE_LOSS)
                 self.mark_train_step_used()
@@ -1010,6 +1196,8 @@ class PredictiveReplayController:
             "old_logits": [],
             "current_logits": [],
             "predicted_delta_logits": [],
+            "sample_ids": [],
+            "token_positions": [],
         }
 
     def record_predictive_metric_tensors(
@@ -1035,6 +1223,20 @@ class PredictiveReplayController:
         self.predictive_metric_tensor_cache["predicted_delta_logits"].append(
             (layer_idx, predicted_delta_logits.detach().cpu().contiguous())
         )
+        sample_ids, token_positions = self.get_current_token_coordinates()
+        if sample_ids is not None and token_positions is not None:
+            if sample_ids.numel() != old_logits.shape[0] or token_positions.numel() != old_logits.shape[0]:
+                raise RuntimeError(
+                    "P2-A trace coordinates do not align with predictive metric tensors: "
+                    f"sample_ids={sample_ids.numel()} positions={token_positions.numel()} "
+                    f"tokens={old_logits.shape[0]}"
+                )
+            self.predictive_metric_tensor_cache["sample_ids"].append(
+                (layer_idx, sample_ids.detach().cpu().to(torch.int64).contiguous())
+            )
+            self.predictive_metric_tensor_cache["token_positions"].append(
+                (layer_idx, token_positions.detach().cpu().to(torch.int64).contiguous())
+            )
 
     def get_and_clear_predictive_metric_tensors(self) -> dict[str, list[tuple[int, torch.Tensor]]]:
         tensor_cache = {
@@ -1153,6 +1355,7 @@ class PredictiveRouterReplayState:
     ):
         self.controller = controller or get_predictive_replay_controller()
         self.layer_idx = len(self.controller.router_states) if layer_idx is None else layer_idx
+        self.global_layer_idx = self.layer_idx
         self.predictive_action = RouterPredictiveAction.DISABLED
         self.recorded_old_inputs: torch.Tensor | None = None
         self.recorded_old_logits: torch.Tensor | None = None

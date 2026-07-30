@@ -37,6 +37,8 @@ def _empty_predictive_metric_tensor_cache() -> dict[str, list]:
         "old_logits": [],
         "current_logits": [],
         "predicted_delta_logits": [],
+        "sample_ids": [],
+        "token_positions": [],
     }
 
 

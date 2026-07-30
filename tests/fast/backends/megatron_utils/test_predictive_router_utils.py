@@ -10,6 +10,7 @@ from miles.backends.megatron_utils.predictive_router_replay import (
     _build_bias_predictor,
     _ensure_bias_predictor_runtime_placement,
     apply_predictive_route_noise,
+    build_stable_predictive_gaussian_field,
     build_synthetic_predictive_loss,
     calculate_topk_accuracy,
     calculate_routing_map_topk_accuracy,
@@ -19,6 +20,7 @@ from miles.backends.megatron_utils.predictive_router_replay import (
     compute_predictive_loss,
     disable_predictive_param_groups,
     get_predictive_replay_controller,
+    predictive_action_scope,
     restore_predictive_param_groups,
     stabilize_predictive_delta_logits,
 )
@@ -137,25 +139,34 @@ def test_predictive_route_noise_is_deterministic_and_zero_is_bitwise_identity():
         [[4.0, 3.0, 2.0, 1.0], [1.0, 3.0, 2.0, 4.0]],
         dtype=torch.float32,
     )
+    shared = {
+        "layer_scale": 0.75,
+        "sample_ids": torch.tensor([11, 12]),
+        "token_positions": torch.tensor([3, 9]),
+        "outer_step": 17,
+        "mini_step": 0,
+        "layer_idx": 2,
+    }
     identity, identity_metrics = apply_predictive_route_noise(
-        effective_logits=effective_logits,
-        noise_std=0.0,
-        noise_seed=123,
+        effective_logits=effective_logits, noise_std=0.0, noise_seed=123, **shared
     )
     noisy_a, metrics_a = apply_predictive_route_noise(
         effective_logits=effective_logits,
         noise_std=2.0,
         noise_seed=123,
+        **shared,
     )
     noisy_b, metrics_b = apply_predictive_route_noise(
         effective_logits=effective_logits,
         noise_std=2.0,
         noise_seed=123,
+        **shared,
     )
     noisy_other_seed, _ = apply_predictive_route_noise(
         effective_logits=effective_logits,
         noise_std=2.0,
         noise_seed=124,
+        **shared,
     )
 
     assert identity is effective_logits
@@ -171,43 +182,90 @@ def test_predictive_route_noise_is_deterministic_and_zero_is_bitwise_identity():
     assert metrics_a["predictive_route_noise_scale"] > 0
 
 
-def test_predictive_route_noise_seed_schedule_is_reproducible_and_call_specific():
+def test_predictive_route_noise_field_is_partition_and_packing_invariant():
+    sample_ids = torch.tensor([7, 7, 11, 19], dtype=torch.int64)
+    token_positions = torch.tensor([0, 8, 2, 5], dtype=torch.int64)
+    canonical = build_stable_predictive_gaussian_field(
+        seed=42,
+        sample_ids=sample_ids,
+        token_positions=token_positions,
+        outer_step=17,
+        mini_step=0,
+        layer_idx=3,
+        num_experts=8,
+    )
+    permutation = torch.tensor([2, 0, 3, 1])
+    packed = build_stable_predictive_gaussian_field(
+        seed=42,
+        sample_ids=sample_ids[permutation],
+        token_positions=token_positions[permutation],
+        outer_step=17,
+        mini_step=0,
+        layer_idx=3,
+        num_experts=8,
+    )
+    inverse = torch.argsort(permutation)
+    assert torch.equal(canonical, packed[inverse])
+
+    # Splitting the same stable coordinates into arbitrary DP partitions has
+    # no effect on the concatenated field.
+    partitioned = torch.cat(
+        [
+            build_stable_predictive_gaussian_field(
+                seed=42,
+                sample_ids=sample_ids[:1],
+                token_positions=token_positions[:1],
+                outer_step=17,
+                mini_step=0,
+                layer_idx=3,
+                num_experts=8,
+            ),
+            build_stable_predictive_gaussian_field(
+                seed=42,
+                sample_ids=sample_ids[1:],
+                token_positions=token_positions[1:],
+                outer_step=17,
+                mini_step=0,
+                layer_idx=3,
+                num_experts=8,
+            ),
+        ]
+    )
+    assert torch.equal(canonical, partitioned)
+
+
+def test_predictive_route_noise_field_is_resume_stable_and_key_complete():
+    coordinates = {
+        "sample_ids": torch.tensor([3, 5]),
+        "token_positions": torch.tensor([10, 11]),
+        "outer_step": 23,
+        "mini_step": 0,
+        "layer_idx": 4,
+        "num_experts": 6,
+    }
+    uninterrupted = build_stable_predictive_gaussian_field(seed=44, **coordinates)
+    resumed = build_stable_predictive_gaussian_field(seed=44, **coordinates)
+    assert torch.equal(uninterrupted, resumed)
+    for changed in (
+        {"seed": 45},
+        {"outer_step": 24},
+        {"mini_step": 1},
+        {"layer_idx": 5},
+    ):
+        candidate = dict(coordinates)
+        candidate.update(changed)
+        seed = candidate.pop("seed", 44)
+        assert not torch.equal(uninterrupted, build_stable_predictive_gaussian_field(seed=seed, **candidate))
+
+
+def test_predictive_record_context_publishes_explicit_outer_and_mini_step():
     controller = get_predictive_replay_controller()
     controller.reset_registry()
-    controller.begin_recording_round()
-    first_sequence = [
-        controller.next_record_noise_seed(base_seed=42, layer_idx=0),
-        controller.next_record_noise_seed(base_seed=42, layer_idx=0),
-        controller.next_record_noise_seed(base_seed=42, layer_idx=1),
-    ]
-
-    controller.reset_registry()
-    controller.begin_recording_round()
-    repeated_sequence = [
-        controller.next_record_noise_seed(base_seed=42, layer_idx=0),
-        controller.next_record_noise_seed(base_seed=42, layer_idx=0),
-        controller.next_record_noise_seed(base_seed=42, layer_idx=1),
-    ]
-
-    assert repeated_sequence == first_sequence
-    assert len(set(first_sequence)) == len(first_sequence)
-
-
-def test_predictive_route_noise_seed_uses_rollout_id_across_fresh_resume():
-    controller = get_predictive_replay_controller()
-    controller.reset_registry()
-    controller.set_current_step_context(rollout_id=17, step_id=None)
-    controller.begin_recording_round()
-    uninterrupted_seed = controller.next_record_noise_seed(base_seed=42, layer_idx=3)
-
-    controller.reset_registry()
-    for _ in range(5):
-        controller.begin_recording_round()
-    controller.set_current_step_context(rollout_id=17, step_id=None)
-    controller.begin_recording_round()
-    resumed_seed = controller.next_record_noise_seed(base_seed=42, layer_idx=3)
-
-    assert resumed_seed == uninterrupted_seed
+    with pytest.raises(RuntimeError, match="outer_step"):
+        controller.require_current_outer_step()
+    with predictive_action_scope(RouterPredictiveAction.RECORD, rollout_id=19):
+        assert controller.require_current_outer_step() == 19
+        assert controller.require_current_mini_step() == 0
 
 
 def test_calculate_routing_map_topk_accuracy_measures_executed_support():
@@ -239,6 +297,8 @@ def test_pack_recorded_predictive_microbatch_builds_mask_and_storage():
     packed = pack_recorded_predictive_microbatch(
         recorded_old_inputs=recorded_old_inputs,
         recorded_old_logits=recorded_old_logits,
+        packed_sample_ids=torch.tensor([10, 10, 20, 20, 20, 20]),
+        packed_token_positions=torch.tensor([0, 1, 0, 1, 2, 3]),
         total_lengths=[2, 4],
         parallel_state=parallel_state,
         qkv_format="thd",
@@ -257,6 +317,8 @@ def test_pack_recorded_predictive_microbatch_builds_mask_and_storage():
     assert packed.original_total_tokens == 2
     assert packed.selected_total_tokens == 2
     assert packed.predictive_loss_scale == 1.0
+    assert packed.sample_ids_concat.tolist() == [10, 10]
+    assert packed.token_positions_concat.tolist() == [0, 1]
 
 
 def test_pack_recorded_predictive_microbatch_caps_total_tokens_after_sampling():
@@ -369,6 +431,8 @@ def test_predictive_controller_applies_compute_and_skip_modes():
     skipped_microbatch = RecordedPredictiveMicrobatch(
         old_inputs_concat=torch.full((2, 2, 4), 1.0),
         old_logits_concat=torch.full((2, 2, 5), 2.0),
+        sample_ids_concat=None,
+        token_positions_concat=None,
         valid_mask=torch.tensor([True, True], dtype=torch.bool),
         sampled_indices=[0],
         sample_lengths=[2],
@@ -378,6 +442,8 @@ def test_predictive_controller_applies_compute_and_skip_modes():
     valid_microbatch = RecordedPredictiveMicrobatch(
         old_inputs_concat=torch.full((3, 2, 4), 7.0),
         old_logits_concat=torch.full((3, 2, 5), 9.0),
+        sample_ids_concat=torch.tensor([10, 11, 12]),
+        token_positions_concat=torch.tensor([0, 1, 2]),
         valid_mask=torch.tensor([True, False, True], dtype=torch.bool),
         sampled_indices=[1],
         sample_lengths=[3],
@@ -387,6 +453,8 @@ def test_predictive_controller_applies_compute_and_skip_modes():
     empty_microbatch = RecordedPredictiveMicrobatch(
         old_inputs_concat=None,
         old_logits_concat=None,
+        sample_ids_concat=None,
+        token_positions_concat=None,
         valid_mask=torch.zeros(0, dtype=torch.bool),
         sampled_indices=[],
         sample_lengths=[],

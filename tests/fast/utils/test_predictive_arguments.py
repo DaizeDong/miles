@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import importlib
+import json
 import sys
 import types
 from argparse import Namespace
@@ -150,6 +152,8 @@ def _make_validation_args(**overrides):
         "bias_predictor_lr_mult": 1000.0,
         "predictive_route_noise_std": 0.0,
         "predictive_route_noise_seed": 42,
+        "predictive_route_noise_scale_path": None,
+        "predictive_route_noise_scale_sha256": None,
         "predictive_downsample_batch_size": None,
         "predictive_downsample_max_len_limit": None,
         "predictive_max_total_tokens": None,
@@ -303,6 +307,35 @@ def test_predictive_route_noise_requires_predictive_replay():
     args = _make_validation_args(predictive_route_noise_std=0.5)
 
     with pytest.raises(AssertionError, match="requires --enable-predictive-routing-replay"):
+        _validate_predictive_routing_replay_args(args)
+
+
+def test_predictive_route_noise_requires_exact_frozen_scale_binding(tmp_path):
+    scale_path = tmp_path / "scales.json"
+    scale_path.write_text(
+        json.dumps(
+            {
+                "schema": "pr2.p2a.frozen-layer-scales.v1",
+                "noise_field_schema": "pr2.p2a.stable-gaussian-field.v1",
+                "seed": 42,
+                "layer_scales": {"0": 0.25, "1": 0.5},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    digest = hashlib.sha256(scale_path.read_bytes()).hexdigest()
+    args = _make_validation_args(
+        enable_predictive_routing_replay=True,
+        use_routing_replay=True,
+        predictive_route_noise_std=0.5,
+        predictive_route_noise_scale_path=str(scale_path),
+        predictive_route_noise_scale_sha256=digest,
+    )
+    _validate_predictive_routing_replay_args(args)
+
+    args.predictive_route_noise_scale_sha256 = "0" * 64
+    with pytest.raises(AssertionError, match="mismatch"):
         _validate_predictive_routing_replay_args(args)
 
 

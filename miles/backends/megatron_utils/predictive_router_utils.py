@@ -23,6 +23,8 @@ PREDICTIVE_STORAGE_DTYPE_MAP = {
 class RecordedPredictiveMicrobatch:
     old_inputs_concat: torch.Tensor | None
     old_logits_concat: torch.Tensor | None
+    sample_ids_concat: torch.Tensor | None
+    token_positions_concat: torch.Tensor | None
     valid_mask: torch.Tensor
     sampled_indices: list[int]
     sample_lengths: list[int]
@@ -208,6 +210,8 @@ def pack_recorded_predictive_microbatch(
     *,
     recorded_old_inputs: Sequence[torch.Tensor],
     recorded_old_logits: Sequence[torch.Tensor],
+    packed_sample_ids: torch.Tensor | None = None,
+    packed_token_positions: torch.Tensor | None = None,
     total_lengths: Sequence[int],
     parallel_state,
     qkv_format: str = "thd",
@@ -228,6 +232,8 @@ def pack_recorded_predictive_microbatch(
         return RecordedPredictiveMicrobatch(
             old_inputs_concat=None,
             old_logits_concat=None,
+            sample_ids_concat=None,
+            token_positions_concat=None,
             valid_mask=empty_mask,
             sampled_indices=[],
             sample_lengths=[],
@@ -236,6 +242,17 @@ def pack_recorded_predictive_microbatch(
         )
 
     token_count = int(recorded_old_inputs[0].shape[0])
+    if (packed_sample_ids is None) != (packed_token_positions is None):
+        raise ValueError("packed_sample_ids and packed_token_positions must be provided together.")
+    if packed_sample_ids is not None:
+        packed_sample_ids = packed_sample_ids.detach().reshape(-1)
+        packed_token_positions = packed_token_positions.detach().reshape(-1)
+        if packed_sample_ids.numel() != token_count or packed_token_positions.numel() != token_count:
+            raise ValueError(
+                "Packed P2-A token coordinates must align with recorded predictive tokens: "
+                f"sample_ids={packed_sample_ids.numel()}, token_positions={packed_token_positions.numel()}, "
+                f"token_count={token_count}."
+            )
     for layer_idx, (old_input, old_logit) in enumerate(zip(recorded_old_inputs, recorded_old_logits, strict=True)):
         if old_input.shape[0] != token_count or old_logit.shape[0] != token_count:
             raise ValueError(
@@ -292,6 +309,8 @@ def pack_recorded_predictive_microbatch(
         return RecordedPredictiveMicrobatch(
             old_inputs_concat=None,
             old_logits_concat=None,
+            sample_ids_concat=None,
+            token_positions_concat=None,
             valid_mask=_to_cpu_storage_tensor(valid_mask),
             sampled_indices=sampled_indices,
             sample_lengths=sample_lengths,
@@ -305,6 +324,8 @@ def pack_recorded_predictive_microbatch(
     target_dtype = predictive_storage_dtype_to_torch_dtype(storage_dtype)
     sampled_inputs_cpu = []
     sampled_logits_cpu = []
+    sampled_ids_cpu = []
+    sampled_positions_cpu = []
     for sample_idx in sampled_indices:
         keep_count = int(sampled_token_counts.get(sample_idx, 0))
         if keep_count <= 0:
@@ -325,13 +346,22 @@ def pack_recorded_predictive_microbatch(
             sample_logit = sample_logit.to(target_dtype)
         sampled_inputs_cpu.append(_to_cpu_storage_tensor(sample_input))
         sampled_logits_cpu.append(_to_cpu_storage_tensor(sample_logit))
+        if packed_sample_ids is not None:
+            sampled_ids_cpu.append(_to_cpu_storage_tensor(packed_sample_ids[start_idx:end_idx].to(torch.int64)))
+            sampled_positions_cpu.append(
+                _to_cpu_storage_tensor(packed_token_positions[start_idx:end_idx].to(torch.int64))
+            )
 
     old_inputs_concat = torch.cat(sampled_inputs_cpu, dim=0)
     old_logits_concat = torch.cat(sampled_logits_cpu, dim=0)
+    sample_ids_concat = torch.cat(sampled_ids_cpu, dim=0) if sampled_ids_cpu else None
+    token_positions_concat = torch.cat(sampled_positions_cpu, dim=0) if sampled_positions_cpu else None
 
     return RecordedPredictiveMicrobatch(
         old_inputs_concat=old_inputs_concat,
         old_logits_concat=old_logits_concat,
+        sample_ids_concat=sample_ids_concat,
+        token_positions_concat=token_positions_concat,
         valid_mask=_to_cpu_storage_tensor(valid_mask),
         sampled_indices=sampled_indices,
         sample_lengths=sample_lengths,

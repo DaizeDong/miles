@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -50,6 +51,8 @@ def _validate_predictive_routing_replay_args(args):
     predictor_hidden_size = int(getattr(args, "bias_predictor_hidden_size", 64))
     route_noise_std = float(getattr(args, "predictive_route_noise_std", 0.0))
     route_noise_seed = int(getattr(args, "predictive_route_noise_seed", 42))
+    route_noise_scale_path = getattr(args, "predictive_route_noise_scale_path", None)
+    route_noise_scale_sha256 = getattr(args, "predictive_route_noise_scale_sha256", None)
 
     if predictor_architecture not in PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES:
         raise AssertionError(
@@ -62,14 +65,64 @@ def _validate_predictive_routing_replay_args(args):
         raise AssertionError("--predictive-route-noise-std must be finite and greater than or equal to 0.")
     if route_noise_seed < 0:
         raise AssertionError("--predictive-route-noise-seed must be greater than or equal to 0.")
+    if route_noise_scale_sha256 is not None and (
+        len(route_noise_scale_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in route_noise_scale_sha256)
+    ):
+        raise AssertionError("--predictive-route-noise-scale-sha256 must be a lowercase 64-character SHA-256.")
 
     if not predictive_enabled:
-        if route_noise_std != 0:
+        if route_noise_std != 0 or route_noise_scale_path is not None or route_noise_scale_sha256 is not None:
             raise AssertionError(
                 "--predictive-route-noise-std requires --enable-predictive-routing-replay because the "
                 "intervention is defined on PR2's predicted RECORD route."
             )
         return
+
+    if route_noise_std > 0:
+        if not route_noise_scale_path or not route_noise_scale_sha256:
+            raise AssertionError(
+                "--predictive-route-noise-std > 0 requires both --predictive-route-noise-scale-path and "
+                "--predictive-route-noise-scale-sha256 from a frozen fresh-clean P2-A trace."
+            )
+        if not os.path.isfile(route_noise_scale_path):
+            raise AssertionError(
+                f"--predictive-route-noise-scale-path is not a regular file: {route_noise_scale_path}"
+            )
+        with open(route_noise_scale_path, "rb") as scale_file:
+            actual_scale_sha256 = hashlib.sha256(scale_file.read()).hexdigest()
+        if actual_scale_sha256 != route_noise_scale_sha256:
+            raise AssertionError(
+                "--predictive-route-noise-scale-sha256 mismatch: "
+                f"expected={route_noise_scale_sha256} actual={actual_scale_sha256}"
+            )
+        with open(route_noise_scale_path, encoding="utf-8") as scale_file:
+            scale_payload = json.load(scale_file)
+        if scale_payload.get("schema") != "pr2.p2a.frozen-layer-scales.v1":
+            raise AssertionError("Predictive route-noise scale file has the wrong P2-A schema.")
+        if scale_payload.get("noise_field_schema") != "pr2.p2a.stable-gaussian-field.v1":
+            raise AssertionError("Predictive route-noise scale file has the wrong stable-noise-field schema.")
+        if int(scale_payload.get("seed", -1)) != route_noise_seed:
+            raise AssertionError(
+                "Predictive route-noise scale seed does not match --predictive-route-noise-seed."
+            )
+        layer_scales = scale_payload.get("layer_scales")
+        if not isinstance(layer_scales, dict) or not layer_scales:
+            raise AssertionError("Predictive route-noise scale file must contain non-empty layer_scales.")
+        for layer_key, layer_scale in layer_scales.items():
+            try:
+                layer_index = int(layer_key)
+                layer_scale = float(layer_scale)
+            except (TypeError, ValueError) as exc:
+                raise AssertionError("Predictive route-noise layer_scales must map integer layers to floats.") from exc
+            if layer_index < 0 or not math.isfinite(layer_scale) or layer_scale < 1e-6:
+                raise AssertionError(
+                    "Predictive route-noise layer_scales require non-negative layers and finite scales >= 1e-6."
+                )
+    elif route_noise_scale_path is not None or route_noise_scale_sha256 is not None:
+        raise AssertionError(
+            "Predictive route-noise scale bindings are only valid when --predictive-route-noise-std > 0."
+        )
 
     if getattr(args, "train_backend", None) != "megatron":
         raise AssertionError("predictive routing replay is only supported for the megatron backend.")
@@ -1265,9 +1318,25 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=42,
                 help=(
-                    "Base seed for the deterministic RECORD-only route-noise field. Seeds are mixed with the "
-                    "record round, DP rank, router layer, and local router-call index."
+                    "Base seed for the deterministic RECORD-only P2-A route-noise field. It is mixed with stable "
+                    "sample id, token position, outer step, mini-step, router layer, and expert coordinates; it "
+                    "does not depend on DP partition, packing, or local call order."
                 ),
+            )
+            pr2_group.add_argument(
+                "--predictive-route-noise-scale-path",
+                type=str,
+                default=None,
+                help=(
+                    "Frozen fresh-clean P2-A JSON containing per-layer s_l scales. Required, together with its "
+                    "exact SHA-256, whenever --predictive-route-noise-std is positive."
+                ),
+            )
+            pr2_group.add_argument(
+                "--predictive-route-noise-scale-sha256",
+                type=str,
+                default=None,
+                help="Lowercase SHA-256 of --predictive-route-noise-scale-path; mismatch fails closed.",
             )
             pr2_group.add_argument(
                 "--predictive-downsample-batch-size",

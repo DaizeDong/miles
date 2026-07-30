@@ -19,6 +19,37 @@ from .parallel import get_parallel_state
 logger = logging.getLogger(__name__)
 
 
+def build_stable_token_coordinate_rows(
+    tokens: Sequence[torch.Tensor],
+    sample_indices: Sequence[int],
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Build P2-A sample/token coordinates before any DP/CP packing.
+
+    ``sample_indices`` originates from ``Sample.index`` and therefore remains
+    stable when microbatches are repartitioned.  Applying the same CP slicing
+    and padding operations as the token rows later in ``get_batch`` makes the
+    resulting field independent of local packing order.
+    """
+    if len(tokens) != len(sample_indices):
+        raise ValueError(
+            f"P2-A coordinate rows require one sample index per token row: "
+            f"tokens={len(tokens)} sample_indices={len(sample_indices)}"
+        )
+    sample_id_rows = []
+    token_position_rows = []
+    for token_row, sample_index in zip(tokens, sample_indices, strict=True):
+        sample_index = int(sample_index)
+        if sample_index < 0:
+            raise ValueError(f"P2-A sample indices must be non-negative, got {sample_index}.")
+        sample_id_rows.append(
+            torch.full((token_row.numel(),), sample_index, dtype=torch.int64, device=token_row.device)
+        )
+        token_position_rows.append(
+            torch.arange(token_row.numel(), dtype=torch.int64, device=token_row.device)
+        )
+    return sample_id_rows, token_position_rows
+
+
 def _rollout_logprob_dtype(args: Namespace) -> torch.dtype:
     if getattr(args, "true_on_policy_mode", False):
         if getattr(args, "bf16", False):
@@ -141,6 +172,13 @@ def get_batch(
     expand_multimodal_rollout_data_in_place(batch, qkv_format=qkv_format)
 
     tokens = batch["tokens"]
+    sample_id_rows = None
+    token_position_rows = None
+    if batch.get("sample_indices") is not None:
+        sample_id_rows, token_position_rows = build_stable_token_coordinate_rows(
+            tokens,
+            batch["sample_indices"],
+        )
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = parallel_state.tp.size * pad_multiplier
@@ -163,6 +201,23 @@ def get_batch(
         else:
             tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
+        if sample_id_rows is not None:
+            if allgather_cp:
+                sample_id_rows = [
+                    F.pad(row, (0, max_seqlen - row.size(0)), value=-1)[start : start + local_len]
+                    for row in sample_id_rows
+                ]
+                token_position_rows = [
+                    F.pad(row, (0, max_seqlen - row.size(0)), value=-1)[start : start + local_len]
+                    for row in token_position_rows
+                ]
+            else:
+                sample_id_rows = [slice_with_cp(row, -1, qkv_format, max_seqlen) for row in sample_id_rows]
+                token_position_rows = [
+                    slice_with_cp(row, -1, qkv_format, max_seqlen) for row in token_position_rows
+                ]
+            packed_sample_ids = torch.stack(sample_id_rows)
+            packed_token_positions = torch.stack(token_position_rows)
 
     elif qkv_format == "thd":
         cp_rank = parallel_state.cp.rank
@@ -186,8 +241,19 @@ def get_batch(
 
             cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=torch.cuda.current_device())
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
+            if sample_id_rows is not None:
+                packed_sample_ids = torch.cat(sample_id_rows, dim=0)
+                packed_token_positions = torch.cat(token_position_rows, dim=0)
+                if pad != 0:
+                    packed_sample_ids = F.pad(packed_sample_ids, (0, pad), value=-1)
+                    packed_token_positions = F.pad(packed_token_positions, (0, pad), value=-1)
+                packed_sample_ids = packed_sample_ids.chunk(cp_size, dim=0)[cp_rank]
+                packed_token_positions = packed_token_positions.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
+            if sample_id_rows is not None:
+                sample_id_rows = [slice_with_cp(row, -1, qkv_format) for row in sample_id_rows]
+                token_position_rows = [slice_with_cp(row, -1, qkv_format) for row in token_position_rows]
 
             cu_seqlens = [0]
             for t in tokens:
@@ -200,6 +266,12 @@ def get_batch(
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens.append(cu_seqlens[-1] + pad)
+            if sample_id_rows is not None:
+                packed_sample_ids = torch.cat(sample_id_rows, dim=0)
+                packed_token_positions = torch.cat(token_position_rows, dim=0)
+                if pad != 0:
+                    packed_sample_ids = F.pad(packed_sample_ids, (0, pad), value=-1)
+                    packed_token_positions = F.pad(packed_token_positions, (0, pad), value=-1)
 
             # thd requires the cu_seqlens to be of the origin length
             cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int).cuda() * cp_size
@@ -214,6 +286,22 @@ def get_batch(
         raise ValueError(f"Unsupported qkv_format: {qkv_format}")
 
     batch["tokens"] = tokens
+    if sample_id_rows is not None:
+        if qkv_format == "thd":
+            packed_sample_ids = packed_sample_ids.unsqueeze(0)
+            packed_token_positions = packed_token_positions.unsqueeze(0)
+        if packed_sample_ids.shape != tokens.shape or packed_token_positions.shape != tokens.shape:
+            raise RuntimeError(
+                "P2-A packed token coordinates diverged from tokens: "
+                f"sample_ids={packed_sample_ids.shape} positions={packed_token_positions.shape} tokens={tokens.shape}"
+            )
+        batch["predictive_sample_ids"] = packed_sample_ids
+        batch["predictive_token_positions"] = packed_token_positions
+        batch["global_token_ids"] = torch.where(
+            packed_sample_ids >= 0,
+            packed_sample_ids * (1 << 32) + packed_token_positions,
+            torch.full_like(packed_sample_ids, -1),
+        )
 
     if get_position_ids:
         assert not allgather_cp, "allgather CP is not supported for FSDP"
