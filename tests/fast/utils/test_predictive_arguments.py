@@ -128,6 +128,7 @@ _install_argument_test_stubs()
 arguments = importlib.import_module("miles.utils.arguments")
 PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES = arguments.PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES
 PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES = arguments.PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES
+PREDICTIVE_ROUTING_REPLAY_CACHE_SAMPLING_MODES = arguments.PREDICTIVE_ROUTING_REPLAY_CACHE_SAMPLING_MODES
 PREDICTIVE_ROUTING_REPLAY_LAYER_SCALE_SCHEDULES = arguments.PREDICTIVE_ROUTING_REPLAY_LAYER_SCALE_SCHEDULES
 PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES = arguments.PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES
 _validate_predictive_routing_replay_args = arguments._validate_predictive_routing_replay_args
@@ -153,15 +154,21 @@ def _make_validation_args(**overrides):
         "predictive_downsample_batch_size": None,
         "predictive_downsample_max_len_limit": None,
         "predictive_max_total_tokens": None,
+        "predictive_cache_sampling_mode": "balanced-prefix",
+        "predictive_response_cache_tokens": None,
+        "predictive_paper_cache": False,
         "predictive_boundary_loss_max_weight": None,
         "predictive_boundary_loss_min_margin": 1e-4,
         "predictive_layer_scale_schedule": "none",
         "predictive_layer_scale_min": 1.0,
         "predictive_storage_dtype": "bf16",
+        "predictive_hidden_storage_dtype": None,
+        "predictive_logits_storage_dtype": None,
         "train_backend": "megatron",
         "use_routing_replay": False,
         "use_rollout_routing_replay": False,
         "allgather_cp": False,
+        "context_parallel_size": 1,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -202,6 +209,15 @@ def test_predictive_flags_parse():
             "0.5",
             "--predictive-storage-dtype",
             "fp16",
+            "--predictive-cache-sampling-mode",
+            "response-uniform",
+            "--predictive-response-cache-tokens",
+            "2048",
+            "--predictive-hidden-storage-dtype",
+            "bf16",
+            "--predictive-logits-storage-dtype",
+            "fp32",
+            "--predictive-paper-cache",
         ]
     )
 
@@ -220,6 +236,11 @@ def test_predictive_flags_parse():
     assert args.predictive_layer_scale_schedule == "sqrt_decay"
     assert args.predictive_layer_scale_min == pytest.approx(0.5)
     assert args.predictive_storage_dtype == "fp16"
+    assert args.predictive_cache_sampling_mode == "response-uniform"
+    assert args.predictive_response_cache_tokens == 2048
+    assert args.predictive_hidden_storage_dtype == "bf16"
+    assert args.predictive_logits_storage_dtype == "fp32"
+    assert args.predictive_paper_cache is True
 
 
 def test_router_logits_flags_parse():
@@ -395,6 +416,46 @@ def test_predictive_validation_accepts_supported_storage_dtypes(storage_dtype):
     )
 
     _validate_predictive_routing_replay_args(args)
+
+
+def test_predictive_validation_accepts_fail_closed_paper_cache_contract():
+    args = _make_validation_args(
+        enable_predictive_routing_replay=True,
+        use_routing_replay=True,
+        predictive_paper_cache=True,
+        predictive_cache_sampling_mode="response-uniform",
+        predictive_response_cache_tokens=2048,
+        predictive_hidden_storage_dtype="bf16",
+        predictive_logits_storage_dtype="fp32",
+    )
+
+    _validate_predictive_routing_replay_args(args)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"predictive_response_cache_tokens": 1024}, "Tc=2048"),
+        ({"predictive_hidden_storage_dtype": "fp32"}, "hidden cache BF16"),
+        ({"predictive_logits_storage_dtype": "bf16"}, "router-logit cache FP32"),
+        ({"context_parallel_size": 2}, "context parallel size 1"),
+    ],
+)
+def test_predictive_validation_rejects_paper_cache_contract_drift(overrides, message):
+    values = {
+        "enable_predictive_routing_replay": True,
+        "use_routing_replay": True,
+        "predictive_paper_cache": True,
+        "predictive_cache_sampling_mode": "response-uniform",
+        "predictive_response_cache_tokens": 2048,
+        "predictive_hidden_storage_dtype": "bf16",
+        "predictive_logits_storage_dtype": "fp32",
+    }
+    values.update(overrides)
+    args = _make_validation_args(**values)
+
+    with pytest.raises(AssertionError, match=message):
+        _validate_predictive_routing_replay_args(args)
 
 
 def test_predictive_validation_accepts_zero_lr_multiplier():

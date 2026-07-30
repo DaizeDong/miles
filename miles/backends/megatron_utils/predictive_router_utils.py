@@ -175,6 +175,67 @@ def build_sampled_token_mask(
     return valid_mask
 
 
+def _build_uniform_response_sampled_positions(
+    *,
+    sample_lengths: Sequence[int],
+    response_lengths: Sequence[int],
+    tokens_per_response: int,
+    total_token_count: int,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, list[int], list[int], list[int]]:
+    """Select up to ``Tc`` generated-token positions per response.
+
+    Positions are uniform without replacement within the response suffix of
+    each packed sequence.  Sorting the sampled positions after ``randperm``
+    keeps the concatenated cache in the same order as boolean indexing during
+    the current-policy replay pass.
+    """
+    sample_lengths = [int(length) for length in _as_list(sample_lengths)]
+    response_lengths = [int(length) for length in _as_list(response_lengths)]
+    if len(sample_lengths) != len(response_lengths):
+        raise ValueError(
+            f"response_lengths length {len(response_lengths)} != sample_lengths length {len(sample_lengths)}"
+        )
+    if tokens_per_response <= 0:
+        raise ValueError(f"tokens_per_response must be positive, got {tokens_per_response}")
+
+    valid_mask = torch.zeros(total_token_count, dtype=torch.bool)
+    sampled_indices: list[int] = []
+    selected_sample_lengths: list[int] = []
+    selected_positions: list[int] = []
+    offset = 0
+    for sample_idx, (sample_length, response_length) in enumerate(
+        zip(sample_lengths, response_lengths, strict=True)
+    ):
+        if sample_length < 0 or response_length < 0 or response_length > sample_length:
+            raise ValueError(
+                f"Invalid packed/response lengths for sample {sample_idx}: "
+                f"sample_length={sample_length}, response_length={response_length}"
+            )
+        next_offset = offset + sample_length
+        if next_offset > total_token_count:
+            raise ValueError(
+                f"sample_lengths sum exceeded total_token_count: offset={offset}, "
+                f"sample_length={sample_length}, total_token_count={total_token_count}"
+            )
+        keep_count = min(response_length, int(tokens_per_response))
+        if keep_count > 0:
+            response_start = next_offset - response_length
+            if keep_count == response_length:
+                relative_positions = torch.arange(response_length, dtype=torch.long)
+            else:
+                relative_positions = torch.randperm(response_length, generator=generator)[:keep_count]
+                relative_positions = torch.sort(relative_positions).values
+            absolute_positions = relative_positions + response_start
+            valid_mask[absolute_positions] = True
+            sampled_indices.append(sample_idx)
+            selected_sample_lengths.append(keep_count)
+            selected_positions.extend(int(position) for position in absolute_positions.tolist())
+        offset = next_offset
+
+    return valid_mask, sampled_indices, selected_sample_lengths, selected_positions
+
+
 def _allocate_balanced_keep_counts(lengths: Sequence[int], max_tokens: int | None) -> list[int]:
     lengths = [int(length) for length in lengths]
     total_tokens = sum(lengths)
@@ -209,6 +270,7 @@ def pack_recorded_predictive_microbatch(
     recorded_old_inputs: Sequence[torch.Tensor],
     recorded_old_logits: Sequence[torch.Tensor],
     total_lengths: Sequence[int],
+    response_lengths: Sequence[int] | None = None,
     parallel_state,
     qkv_format: str = "thd",
     max_seq_lens: Sequence[int] | None = None,
@@ -217,6 +279,10 @@ def pack_recorded_predictive_microbatch(
     max_len_limit: int | None = None,
     max_total_tokens: int | None = None,
     storage_dtype: str = "bf16",
+    hidden_storage_dtype: str | None = None,
+    logits_storage_dtype: str | None = None,
+    cache_sampling_mode: str = "balanced-prefix",
+    response_cache_tokens: int | None = None,
     generator: torch.Generator | None = None,
 ) -> RecordedPredictiveMicrobatch:
     if len(recorded_old_inputs) != len(recorded_old_logits):
@@ -256,37 +322,63 @@ def pack_recorded_predictive_microbatch(
             f"Local sample lengths sum {consumed_token_count} exceeds recorded token count {token_count}."
         )
 
-    sampled_indices = _select_predictive_sample_indices(
-        sample_lengths=sample_lengths,
-        downsample_batch_size=downsample_batch_size,
-        max_len_limit=max_len_limit,
-        generator=generator,
-    )
-    offset = 0
-    sample_ranges = []
-    for sample_length in sample_lengths:
-        next_offset = offset + sample_length
-        sample_ranges.append((offset, next_offset))
-        offset = next_offset
-
-    original_total_tokens = sum(int(sample_lengths[sample_idx]) for sample_idx in sampled_indices)
-    sampled_original_lengths = [int(sample_lengths[sample_idx]) for sample_idx in sampled_indices]
-    sampled_keep_counts = _allocate_balanced_keep_counts(sampled_original_lengths, max_total_tokens)
-    sampled_token_counts = {
-        int(sample_idx): int(keep_count)
-        for sample_idx, keep_count in zip(sampled_indices, sampled_keep_counts, strict=True)
-        if int(keep_count) > 0
-    }
-    selected_total_tokens = sum(int(keep_count) for keep_count in sampled_keep_counts)
-
-    valid_mask = build_sampled_token_mask(
-        sample_lengths=sample_lengths,
-        sampled_token_counts=sampled_token_counts,
-        total_token_count=token_count,
-    )
-    predictive_loss_scale = 1.0
-    if original_total_tokens > 0:
-        predictive_loss_scale = min(1.0, float(selected_total_tokens) / float(original_total_tokens))
+    if cache_sampling_mode == "response-uniform":
+        if response_lengths is None:
+            raise ValueError("response-uniform cache sampling requires response_lengths")
+        if response_cache_tokens is None:
+            raise ValueError("response-uniform cache sampling requires response_cache_tokens")
+        if int(getattr(parallel_state, "cp_size", 1)) != 1 or qkv_format != "thd":
+            raise ValueError("response-uniform cache sampling currently requires CP=1 and qkv_format='thd'")
+        if downsample_batch_size is not None or max_len_limit is not None or max_total_tokens is not None:
+            raise ValueError("response-uniform cache sampling cannot be combined with legacy cache sampling limits")
+        response_lengths = [int(length) for length in _as_list(response_lengths)]
+        valid_mask, sampled_indices, sampled_keep_counts, selected_positions = (
+            _build_uniform_response_sampled_positions(
+                sample_lengths=sample_lengths,
+                response_lengths=response_lengths,
+                tokens_per_response=int(response_cache_tokens),
+                total_token_count=token_count,
+                generator=generator,
+            )
+        )
+        original_total_tokens = sum(int(response_lengths[sample_idx]) for sample_idx in sampled_indices)
+        selected_total_tokens = sum(sampled_keep_counts)
+        # Appendix E.1 defines a uniformly sampled feature-cache objective,
+        # not the legacy selected/original multiplicative loss attenuation.
+        predictive_loss_scale = 1.0
+        sampled_token_counts = {
+            int(sample_idx): int(keep_count)
+            for sample_idx, keep_count in zip(sampled_indices, sampled_keep_counts, strict=True)
+        }
+    elif cache_sampling_mode == "balanced-prefix":
+        if response_cache_tokens is not None:
+            raise ValueError("response_cache_tokens is only valid with response-uniform sampling")
+        sampled_indices = _select_predictive_sample_indices(
+            sample_lengths=sample_lengths,
+            downsample_batch_size=downsample_batch_size,
+            max_len_limit=max_len_limit,
+            generator=generator,
+        )
+        original_total_tokens = sum(int(sample_lengths[sample_idx]) for sample_idx in sampled_indices)
+        sampled_original_lengths = [int(sample_lengths[sample_idx]) for sample_idx in sampled_indices]
+        sampled_keep_counts = _allocate_balanced_keep_counts(sampled_original_lengths, max_total_tokens)
+        sampled_token_counts = {
+            int(sample_idx): int(keep_count)
+            for sample_idx, keep_count in zip(sampled_indices, sampled_keep_counts, strict=True)
+            if int(keep_count) > 0
+        }
+        selected_total_tokens = sum(int(keep_count) for keep_count in sampled_keep_counts)
+        valid_mask = build_sampled_token_mask(
+            sample_lengths=sample_lengths,
+            sampled_token_counts=sampled_token_counts,
+            total_token_count=token_count,
+        )
+        selected_positions = valid_mask.nonzero(as_tuple=False).flatten().tolist()
+        predictive_loss_scale = 1.0
+        if original_total_tokens > 0:
+            predictive_loss_scale = min(1.0, float(selected_total_tokens) / float(original_total_tokens))
+    else:
+        raise ValueError(f"Unsupported cache_sampling_mode: {cache_sampling_mode!r}")
 
     if not sampled_token_counts:
         return RecordedPredictiveMicrobatch(
@@ -302,32 +394,23 @@ def pack_recorded_predictive_microbatch(
             selected_sample_lengths=[int(length) for length in sampled_keep_counts],
         )
 
-    target_dtype = predictive_storage_dtype_to_torch_dtype(storage_dtype)
-    sampled_inputs_cpu = []
-    sampled_logits_cpu = []
-    for sample_idx in sampled_indices:
-        keep_count = int(sampled_token_counts.get(sample_idx, 0))
-        if keep_count <= 0:
-            continue
-        start_idx, end_idx = sample_ranges[sample_idx]
-        end_idx = start_idx + keep_count
-        sample_input = torch.stack(
-            [old_input[start_idx:end_idx].detach() for old_input in recorded_old_inputs],
-            dim=1,
-        )
-        sample_logit = torch.stack(
-            [old_logit[start_idx:end_idx].detach() for old_logit in recorded_old_logits],
-            dim=1,
-        )
-        if sample_input.dtype != target_dtype:
-            sample_input = sample_input.to(target_dtype)
-        if sample_logit.dtype != target_dtype:
-            sample_logit = sample_logit.to(target_dtype)
-        sampled_inputs_cpu.append(_to_cpu_storage_tensor(sample_input))
-        sampled_logits_cpu.append(_to_cpu_storage_tensor(sample_logit))
-
-    old_inputs_concat = torch.cat(sampled_inputs_cpu, dim=0)
-    old_logits_concat = torch.cat(sampled_logits_cpu, dim=0)
+    hidden_target_dtype = predictive_storage_dtype_to_torch_dtype(hidden_storage_dtype or storage_dtype)
+    logits_target_dtype = predictive_storage_dtype_to_torch_dtype(logits_storage_dtype or storage_dtype)
+    selected_positions_tensor = torch.tensor(selected_positions, dtype=torch.long, device=recorded_old_inputs[0].device)
+    sampled_inputs = torch.stack(
+        [old_input.index_select(0, selected_positions_tensor).detach() for old_input in recorded_old_inputs],
+        dim=1,
+    )
+    sampled_logits = torch.stack(
+        [old_logit.index_select(0, selected_positions_tensor).detach() for old_logit in recorded_old_logits],
+        dim=1,
+    )
+    if sampled_inputs.dtype != hidden_target_dtype:
+        sampled_inputs = sampled_inputs.to(hidden_target_dtype)
+    if sampled_logits.dtype != logits_target_dtype:
+        sampled_logits = sampled_logits.to(logits_target_dtype)
+    old_inputs_concat = _to_cpu_storage_tensor(sampled_inputs)
+    old_logits_concat = _to_cpu_storage_tensor(sampled_logits)
 
     return RecordedPredictiveMicrobatch(
         old_inputs_concat=old_inputs_concat,

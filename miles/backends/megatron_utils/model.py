@@ -343,6 +343,7 @@ def _collect_recorded_predictive_microbatch(
             recorded_old_inputs=recorded_old_inputs,
             recorded_old_logits=recorded_old_logits,
             total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
             parallel_state=parallel_state,
             qkv_format=args.qkv_format,
             max_seq_lens=batch.get("max_seq_lens", None),
@@ -351,6 +352,10 @@ def _collect_recorded_predictive_microbatch(
             max_len_limit=getattr(args, "predictive_downsample_max_len_limit", None),
             max_total_tokens=getattr(args, "predictive_max_total_tokens", None),
             storage_dtype=getattr(args, "predictive_storage_dtype", "fp32"),
+            hidden_storage_dtype=getattr(args, "predictive_hidden_storage_dtype", None),
+            logits_storage_dtype=getattr(args, "predictive_logits_storage_dtype", None),
+            cache_sampling_mode=getattr(args, "predictive_cache_sampling_mode", "balanced-prefix"),
+            response_cache_tokens=getattr(args, "predictive_response_cache_tokens", None),
         )
     )
 

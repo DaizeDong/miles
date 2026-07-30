@@ -291,6 +291,81 @@ def test_pack_recorded_predictive_microbatch_caps_total_tokens_after_sampling():
     assert packed.predictive_loss_scale == 0.5
 
 
+def test_pack_recorded_predictive_microbatch_paper_cache_is_response_uniform_and_split_dtype():
+    parallel_state = SimpleNamespace(cp_rank=0, cp_size=1)
+    recorded_old_inputs = [
+        torch.arange(27, dtype=torch.float32).reshape(9, 3),
+        torch.arange(27, 54, dtype=torch.float32).reshape(9, 3),
+    ]
+    recorded_old_logits = [
+        torch.arange(36, dtype=torch.float32).reshape(9, 4),
+        torch.arange(36, 72, dtype=torch.float32).reshape(9, 4),
+    ]
+
+    generator = torch.Generator().manual_seed(20260730)
+    packed = pack_recorded_predictive_microbatch(
+        recorded_old_inputs=recorded_old_inputs,
+        recorded_old_logits=recorded_old_logits,
+        total_lengths=[5, 4],
+        response_lengths=[3, 4],
+        parallel_state=parallel_state,
+        qkv_format="thd",
+        cache_sampling_mode="response-uniform",
+        response_cache_tokens=2,
+        hidden_storage_dtype="bf16",
+        logits_storage_dtype="fp32",
+        generator=generator,
+    )
+
+    # The two prompt positions in sample 0 can never enter a response-only cache.
+    assert packed.valid_mask[:2].tolist() == [False, False]
+    assert int(packed.valid_mask.sum().item()) == 4
+    assert packed.sampled_indices == [0, 1]
+    assert packed.selected_sample_lengths == [2, 2]
+    assert packed.original_total_tokens == 7
+    assert packed.selected_total_tokens == 4
+    # The paper cache is an unbiased sampled objective, not a 4/7 loss attenuation.
+    assert packed.predictive_loss_scale == 1.0
+    assert packed.old_inputs_concat.dtype == torch.bfloat16
+    assert packed.old_logits_concat.dtype == torch.float32
+    selected_positions = packed.valid_mask.nonzero(as_tuple=False).flatten()
+    assert torch.equal(
+        packed.old_inputs_concat[:, 0, :].float(),
+        recorded_old_inputs[0].index_select(0, selected_positions),
+    )
+    assert torch.equal(
+        packed.old_logits_concat[:, 1, :],
+        recorded_old_logits[1].index_select(0, selected_positions),
+    )
+
+
+def test_pack_recorded_predictive_microbatch_paper_cache_sampling_is_reproducible():
+    parallel_state = SimpleNamespace(cp_rank=0, cp_size=1)
+    inputs = [torch.randn(20, 3)]
+    logits = [torch.randn(20, 4)]
+
+    def run(seed):
+        return pack_recorded_predictive_microbatch(
+            recorded_old_inputs=inputs,
+            recorded_old_logits=logits,
+            total_lengths=[20],
+            response_lengths=[16],
+            parallel_state=parallel_state,
+            cache_sampling_mode="response-uniform",
+            response_cache_tokens=4,
+            hidden_storage_dtype="bf16",
+            logits_storage_dtype="fp32",
+            generator=torch.Generator().manual_seed(seed),
+        )
+
+    first = run(17)
+    repeated = run(17)
+    other = run(18)
+    assert torch.equal(first.valid_mask, repeated.valid_mask)
+    assert not torch.equal(first.valid_mask, other.valid_mask)
+    assert int(first.valid_mask[:4].sum().item()) == 0
+
+
 def test_build_local_predictive_sample_lengths_uses_arithmetic_layout():
     parallel_state = SimpleNamespace(cp_rank=0, cp_size=2)
 

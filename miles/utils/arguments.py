@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 PREDICTIVE_ROUTING_REPLAY_LOSS_TYPES = ("kl", "kl-post")
 PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES = ("linear", "mlp")
 PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES = ("fp32", "bf16", "fp16")
+PREDICTIVE_ROUTING_REPLAY_CACHE_SAMPLING_MODES = ("balanced-prefix", "response-uniform")
 PREDICTIVE_ROUTING_REPLAY_LAYER_SCALE_SCHEDULES = ("none", "linear_decay", "sqrt_decay", "cosine_decay")
 
 
@@ -50,6 +51,7 @@ def _validate_predictive_routing_replay_args(args):
     predictor_hidden_size = int(getattr(args, "bias_predictor_hidden_size", 64))
     route_noise_std = float(getattr(args, "predictive_route_noise_std", 0.0))
     route_noise_seed = int(getattr(args, "predictive_route_noise_seed", 42))
+    paper_cache = bool(getattr(args, "predictive_paper_cache", False))
 
     if predictor_architecture not in PREDICTIVE_ROUTING_REPLAY_ARCHITECTURES:
         raise AssertionError(
@@ -69,6 +71,8 @@ def _validate_predictive_routing_replay_args(args):
                 "--predictive-route-noise-std requires --enable-predictive-routing-replay because the "
                 "intervention is defined on PR2's predicted RECORD route."
             )
+        if paper_cache:
+            raise AssertionError("--predictive-paper-cache requires --enable-predictive-routing-replay.")
         return
 
     if getattr(args, "train_backend", None) != "megatron":
@@ -101,6 +105,62 @@ def _validate_predictive_routing_replay_args(args):
             f"Unsupported predictive storage dtype: {args.predictive_storage_dtype}. "
             f"Expected one of {PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES}."
         )
+
+    cache_sampling_mode = getattr(args, "predictive_cache_sampling_mode", "balanced-prefix")
+    hidden_storage_dtype = getattr(args, "predictive_hidden_storage_dtype", None)
+    logits_storage_dtype = getattr(args, "predictive_logits_storage_dtype", None)
+    response_cache_tokens = getattr(args, "predictive_response_cache_tokens", None)
+    if cache_sampling_mode not in PREDICTIVE_ROUTING_REPLAY_CACHE_SAMPLING_MODES:
+        raise AssertionError(
+            f"Unsupported predictive cache sampling mode: {cache_sampling_mode}. "
+            f"Expected one of {PREDICTIVE_ROUTING_REPLAY_CACHE_SAMPLING_MODES}."
+        )
+    for flag_name, dtype in (
+        ("--predictive-hidden-storage-dtype", hidden_storage_dtype),
+        ("--predictive-logits-storage-dtype", logits_storage_dtype),
+    ):
+        if dtype is not None and dtype not in PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES:
+            raise AssertionError(
+                f"Unsupported {flag_name} value: {dtype}. "
+                f"Expected one of {PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES}."
+            )
+    if response_cache_tokens is not None and response_cache_tokens <= 0:
+        raise AssertionError("--predictive-response-cache-tokens must be greater than 0 when set.")
+    if cache_sampling_mode == "response-uniform":
+        if response_cache_tokens is None:
+            raise AssertionError(
+                "--predictive-cache-sampling-mode=response-uniform requires "
+                "--predictive-response-cache-tokens."
+            )
+        if getattr(args, "predictive_downsample_batch_size", None) is not None:
+            raise AssertionError("response-uniform cache sampling is incompatible with batch down-sampling.")
+        if getattr(args, "predictive_downsample_max_len_limit", None) is not None:
+            raise AssertionError("response-uniform cache sampling is incompatible with prefix truncation.")
+        if getattr(args, "predictive_max_total_tokens", None) is not None:
+            raise AssertionError("response-uniform cache sampling is incompatible with the legacy packed-token cap.")
+    elif response_cache_tokens is not None:
+        raise AssertionError(
+            "--predictive-response-cache-tokens requires "
+            "--predictive-cache-sampling-mode=response-uniform."
+        )
+
+    if paper_cache:
+        paper_requirements = {
+            "cache sampling mode": cache_sampling_mode == "response-uniform",
+            "response cache length Tc=2048": response_cache_tokens == 2048,
+            "hidden cache BF16": hidden_storage_dtype == "bf16",
+            "router-logit cache FP32": logits_storage_dtype == "fp32",
+            "zero route noise": route_noise_std == 0.0,
+            "no boundary reweighting": getattr(args, "predictive_boundary_loss_max_weight", None) is None,
+            "no depth scaling": getattr(args, "predictive_layer_scale_schedule", "none") == "none",
+            "unit depth scale": float(getattr(args, "predictive_layer_scale_min", 1.0)) == 1.0,
+            "context parallel size 1": int(getattr(args, "context_parallel_size", 1)) == 1,
+        }
+        failed_requirements = [name for name, passed in paper_requirements.items() if not passed]
+        if failed_requirements:
+            raise AssertionError(
+                "--predictive-paper-cache contract failed: " + ", ".join(failed_requirements)
+            )
 
     if args.bias_predictor_lr_mult < 0:
         raise AssertionError("--bias-predictor-lr-mult must be greater than or equal to 0.")
@@ -1288,6 +1348,36 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Hard cap on the total number of tokens in one packed predictive microbatch, applied last after batch + length sub-sampling. Default unset = unlimited.",
             )
             pr2_group.add_argument(
+                "--predictive-cache-sampling-mode",
+                type=str,
+                default="balanced-prefix",
+                choices=PREDICTIVE_ROUTING_REPLAY_CACHE_SAMPLING_MODES,
+                help=(
+                    "Feature-cache token selection. 'balanced-prefix' preserves the legacy packed-microbatch "
+                    "behavior. 'response-uniform' samples positions uniformly without replacement from each "
+                    "generated response and requires --predictive-response-cache-tokens."
+                ),
+            )
+            pr2_group.add_argument(
+                "--predictive-response-cache-tokens",
+                type=int,
+                default=None,
+                help=(
+                    "Per-response feature-cache length Tc for response-uniform sampling. Responses shorter "
+                    "than Tc retain every generated position."
+                ),
+            )
+            pr2_group.add_argument(
+                "--predictive-paper-cache",
+                action="store_true",
+                default=False,
+                help=(
+                    "Fail-closed Appendix-E.1 Qwen cache contract: response-only uniform sampling without "
+                    "replacement, Tc=2048 per response, BF16 hidden features, FP32 router logits, CP=1, "
+                    "and no non-paper cache-loss scaling or stabilizers."
+                ),
+            )
+            pr2_group.add_argument(
                 "--predictive-boundary-loss-max-weight",
                 type=float,
                 default=None,
@@ -1322,6 +1412,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default="fp32",
                 choices=PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES,
                 help="Dtype for the cached router-input + old-logits tensors used by the predictor. Default fp32 (paper-compatible for logits). Paper Table 3 uses bf16 hidden + fp32 logits separately; Miles uses a single dtype for both.",
+            )
+            pr2_group.add_argument(
+                "--predictive-hidden-storage-dtype",
+                type=str,
+                default=None,
+                choices=PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES,
+                help="Optional cache dtype for hidden features. Unset inherits --predictive-storage-dtype.",
+            )
+            pr2_group.add_argument(
+                "--predictive-logits-storage-dtype",
+                type=str,
+                default=None,
+                choices=PREDICTIVE_ROUTING_REPLAY_STORAGE_DTYPES,
+                help="Optional cache dtype for old router logits. Unset inherits --predictive-storage-dtype.",
             )
             pr2_group.add_argument(
                 "--router-logits-path",
