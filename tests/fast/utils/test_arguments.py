@@ -141,3 +141,13 @@ def test_recompute_logprobs_via_prefill_flag_is_parsed():
     args = parser.parse_args(["--recompute-logprobs-via-prefill"] + REQUIRED_ARGS)
 
     assert args.recompute_logprobs_via_prefill is True
+
+
+def test_log_reward_category_help_is_a_formattable_string():
+    parser = argparse.ArgumentParser()
+    get_miles_extra_args_provider()(parser)
+
+    action = next(action for action in parser._actions if "--log-reward-category" in action.option_strings)
+
+    assert isinstance(action.help, str)
+    assert "category of reward" in parser.format_help()
