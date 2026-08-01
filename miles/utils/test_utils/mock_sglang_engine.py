@@ -21,6 +21,8 @@ _RECORDING_METHODS: dict[str, Any] = {
     "resume_memory_occupation": True,
     "update_weights_from_disk": True,
     "update_weights_from_tensor": True,
+    "begin_weight_update": {"success": True, "message": "Success"},
+    "end_weight_update": {"success": True, "message": "Success"},
     "flush_cache": True,
     "pause_generation": None,
     "continue_generation": None,

@@ -206,6 +206,14 @@ class TestUpdateWeightsZeroChunks:
         )
         updater.rollout_engines = [MagicMock()]
         updater.use_distribute = False
+        begin_ref = updater.rollout_engines[0].begin_weight_update.remote.return_value
+
+        def ray_get(refs):
+            if isinstance(refs, list) and refs == [begin_ref]:
+                return [{"success": True, "message": "Success"}]
+            return [None] * len(refs) if isinstance(refs, list) else refs
+
+        mock_ray.get.side_effect = ray_get
 
         with pytest.raises(RuntimeError, match="zero chunks"):
             updater.update_weights()
@@ -240,6 +248,15 @@ class TestUpdateWeightsZeroChunks:
         )
         updater.rollout_engines = [MagicMock()]
         updater.use_distribute = False
+        begin_ref = updater.rollout_engines[0].begin_weight_update.remote.return_value
+        end_ref = updater.rollout_engines[0].end_weight_update.remote.return_value
+
+        def ray_get(refs):
+            if isinstance(refs, list) and refs in ([begin_ref], [end_ref]):
+                return [{"success": True, "message": "Success"}]
+            return [None] * len(refs) if isinstance(refs, list) else refs
+
+        mock_ray.get.side_effect = ray_get
 
         updater.update_weights()
 

@@ -309,6 +309,26 @@ class SGLangEngine(RayActor):
             payload,
         )
 
+    def begin_weight_update(self, selector: str = "all"):
+        """Open the SGLang weight-update transaction.
+
+        Recent SGLang runtimes require every tensor/distributed weight update
+        to be enclosed by ``begin_weight_update``/``end_weight_update``.  The
+        server uses this boundary to restore any in-place-packed weights before
+        loading and to finalize them exactly once after all tensor chunks land.
+        """
+        return self._make_request(
+            "begin_weight_update",
+            {"selector": selector},
+        )
+
+    def end_weight_update(self):
+        """Close and finalize the current SGLang weight-update transaction."""
+        return self._make_request(
+            "end_weight_update",
+            {},
+        )
+
     def get_remote_instance_transfer_engine_info(self, rank: int):
         # TODO: will be changed to `remote_instance_transfer_engine_info` when the sglang side is ready.
         response = requests.get(

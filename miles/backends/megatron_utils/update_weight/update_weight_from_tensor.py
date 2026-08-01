@@ -19,7 +19,6 @@ from miles.backends.training_utils.parallel import get_parallel_state
 from miles.utils.distributed_utils import get_gloo_group
 
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
-from .common import post_process_weights
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed.broadcast import (
     connect_rollout_engines_from_distributed,
@@ -192,15 +191,10 @@ class UpdateWeightFromTensor:
             mode = self.args.pause_generation_mode
             ray.get([engine.pause_generation.remote(mode=mode) for engine in self.rollout_engines])
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-            if (
-                not skip_base_sync
-                and self.quantization_config
-                and self.quantization_config["quant_method"] in ["compressed-tensors"]
-            ):
-                post_process_weights(
-                    rollout_engines=self.rollout_engines,
-                    restore_weights_before_load=True,
-                    post_process_quantization=False,
+            if not skip_base_sync:
+                _run_weight_update_session_phase(
+                    self.rollout_engines,
+                    phase="begin",
                 )
         dist.barrier(group=get_gloo_group())
 
@@ -243,13 +237,13 @@ class UpdateWeightFromTensor:
         dist.barrier(group=get_gloo_group())
 
         if rank == 0:
-            # process_weights_after_loading is a one-shot bf16 → int4/Marlin
-            # transform; skip when no fresh base bytes landed (skip_base_sync).
             if not skip_base_sync:
-                post_process_weights(
-                    rollout_engines=self.rollout_engines,
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
+                # SGLang's transaction end performs the quantization/post-load
+                # finalization once, after every tensor chunk has arrived.  Do
+                # not call the retired legacy post-processing endpoint as well.
+                _run_weight_update_session_phase(
+                    self.rollout_engines,
+                    phase="end",
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
@@ -400,4 +394,36 @@ def _check_weight_sync_results(results: list, *, is_lora: bool) -> None:
             raise RuntimeError(
                 f"{sync_type} weight sync failed on rollout engine: {error_msg}. "
                 f"Check SGLang version compatibility."
+            )
+
+
+def _run_weight_update_session_phase(
+    rollout_engines: Sequence[ActorHandle],
+    *,
+    phase: str,
+) -> None:
+    """Run and fail-closed validate one transaction phase on every engine."""
+    if phase == "begin":
+        refs = [engine.begin_weight_update.remote(selector="all") for engine in rollout_engines]
+    elif phase == "end":
+        refs = [engine.end_weight_update.remote() for engine in rollout_engines]
+    else:
+        raise ValueError(f"unknown weight-update session phase: {phase}")
+
+    results = ray.get(refs)
+    if len(results) != len(rollout_engines):
+        raise RuntimeError(
+            f"SGLang {phase}_weight_update returned {len(results)} results "
+            f"for {len(rollout_engines)} engines"
+        )
+
+    for engine_index, result in enumerate(results):
+        if not isinstance(result, Mapping) or result.get("success") is not True:
+            if isinstance(result, Mapping):
+                error_msg = result.get("message") or result.get("error") or "unknown error"
+            else:
+                error_msg = f"unexpected response type {type(result).__name__}"
+            raise RuntimeError(
+                f"SGLang {phase}_weight_update failed on rollout engine "
+                f"{engine_index}: {error_msg}"
             )
