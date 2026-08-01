@@ -133,11 +133,33 @@ def add_sglang_arguments(parser):
     return parser
 
 
+def _normalize_parallel_size_alias(args, short_name, legacy_name):
+    """Normalize SGLang's short and legacy long parallel-size field names."""
+    has_short = hasattr(args, short_name)
+    has_legacy = hasattr(args, legacy_name)
+    if not has_short and not has_legacy:
+        raise AttributeError(
+            f"SGLang arguments provide neither {short_name!r} nor {legacy_name!r}"
+        )
+
+    if has_short and has_legacy:
+        short_value = getattr(args, short_name)
+        legacy_value = getattr(args, legacy_name)
+        if short_value != legacy_value:
+            raise ValueError(
+                f"Conflicting SGLang aliases: {short_name}={short_value!r} "
+                f"but {legacy_name}={legacy_value!r}"
+            )
+
+    if not has_short:
+        setattr(args, short_name, getattr(args, legacy_name))
+
+
 def validate_args(args):
     args.sglang_tp_size = args.rollout_num_gpus_per_engine
-    args.sglang_dp_size = args.sglang_data_parallel_size
-    args.sglang_pp_size = args.sglang_pipeline_parallel_size
-    args.sglang_ep_size = args.sglang_expert_parallel_size
+    _normalize_parallel_size_alias(args, "sglang_dp_size", "sglang_data_parallel_size")
+    _normalize_parallel_size_alias(args, "sglang_pp_size", "sglang_pipeline_parallel_size")
+    _normalize_parallel_size_alias(args, "sglang_ep_size", "sglang_expert_parallel_size")
     if hasattr(args, "sglang_attention_context_parallel_size"):
         args.sglang_attn_cp_size = args.sglang_attention_context_parallel_size
 
