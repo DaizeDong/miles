@@ -56,7 +56,17 @@ from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed.broadcast import UpdateWeightFromDistributed
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
-from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
+try:
+    from .update_weight.update_weight_from_distributed.p2p import UpdateWeightP2P
+except ModuleNotFoundError as exc:
+    # Mooncake is needed only by the explicit P2P transfer mode.  Keep the
+    # colocated and broadcast implementations importable in lean runtimes.
+    if exc.name != "mooncake":
+        raise
+    UpdateWeightP2P = None
+    _update_weight_p2p_import_error = exc
+else:
+    _update_weight_p2p_import_error = None
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
